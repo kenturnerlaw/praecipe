@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Praecipe</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="caption-bar">
+    <div class="caption-court">In the Circuit Court of the State of Florida</div>
+    <div class="caption-title">Praecipe</div>
+    <div class="caption-sub">Mail that files, bills, and dockets · Fla. Fam. L. R. P. 12.090</div>
+    <div class="caption-actions">
+      <input id="search" type="search" placeholder="Search mail ( / )" autocomplete="off">
+      <span id="timer-chip" class="chip hidden"></span>
+      <span id="unread-chip" class="chip hidden"></span>
+      <button type="button" id="btn-sync">Send/Receive</button>
+      <button type="button" id="btn-compose" class="primary">New Email</button>
+    </div>
+  </div>
+  <div id="reminders" class="reminders hidden"></div>
+
+  <nav class="rail" aria-label="Primary">
+    <button data-view="mail" class="active">Mail <span id="rail-unread"></span></button>
+    <button data-view="docket">Calendar</button>
+    <button data-view="contacts">People</button>
+    <button data-view="matters">Matters</button>
+    <button data-view="time">Time</button>
+    <button data-view="notes">Notes</button>
+    <button data-view="files">Files</button>
+    <button data-view="rules">Rules</button>
+    <button data-view="settings">Settings</button>
+  </nav>
+
+  <main id="app"></main>
+
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+    <div class="modal-card" id="modal-card"></div>
+  </div>
+
+  <p class="disclaimer">Practice aid only. Deadlines use Fla. Fam. L. R. P. 12.090 and Fla. R. Gen. Prac. &amp; Jud. Admin. 2.514. Confirm against the current rules, the order, and local practice. Not legal advice. Keys: N new · R reply · A reply all · F forward · Del delete · J/K move · U unread · / search.</p>
+  <script src="/app.js"></script>
+</body>
+</html>
