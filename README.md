@@ -19,8 +19,8 @@ Open [http://127.0.0.1:12090](http://127.0.0.1:12090).
 3. Daily mail: **New Email**, **Reply**, **Reply All**, **Forward**, **Delete**, **Unread**, **Flag**, search in the top bar.
 4. Open a message. **File & Bill** is one pass: it guesses the matter (with a confidence %), you check connect / save-to-folder-by-type / download service URLs / email the client / time entry, and hit **Do all checked**.
 5. Put the client’s email on the matter so “Email the client” has an address.
-5. **Calendar** is month or week, with clock times and reminders. **Rules** computes Family Law deadlines onto that calendar.
-6. **People** fills from the mail you send and receive. Compose autocompletes those addresses.
+6. **Calendar** is month or week, with clock times and reminders. **Rules** computes Family Law deadlines onto that calendar.
+7. **People** fills from the mail you send and receive. Compose autocompletes those addresses.
 
 Keys: `N` new · `R` reply · `A` reply all · `F` forward · `Del` delete · `J`/`K` next/previous · `U` unread · `/` search.
 
