@@ -18,7 +18,9 @@ from urllib.request import Request, urlopen
 from . import db
 from . import deadlines as rules
 from . import email_sync
+from . import oauth
 from .extract import extract
+from .labels import apply_labels, filter_counts, parse_labels
 from .match import DOC_TYPES, guess_doc_type, match_matters
 from .paths import FILES, MATTER_FILES, PUBLIC, ROOT, ensure_dirs
 
@@ -322,6 +324,107 @@ def handle_api(handler: BaseHTTPRequestHandler, method: str, path: str, query: d
         _json(handler, 200, db.save_settings(_read_json(handler)))
         return
 
+    if path == "/api/accounts/providers" and method == "GET":
+        _json(handler, 200, oauth.list_providers())
+        return
+    if path == "/api/accounts" and method == "GET":
+        _json(handler, 200, db.list_accounts())
+        return
+    if path == "/api/accounts" and method == "POST":
+        p = _read_json(handler)
+        provider = (p.get("provider") or "imap").lower()
+        if provider in oauth.PROVIDERS:
+            p.update(oauth.preset(provider))
+            p["imap_user"] = oauth.imap_user_for(provider, p.get("email") or "")
+            p["smtp_user"] = (p.get("email") or "").strip()
+        password = "".join((p.get("password") or p.get("imap_password") or "").split())
+        p["password"] = password
+        p["imap_password"] = password
+        p["smtp_password"] = password
+        if p.get("auth_type") != "oauth" and not password:
+            _json(handler, 400, {"error": "Paste the app password from the provider, then Add Account."})
+            return
+        trial = dict(p)
+        trial.setdefault("auth_type", "password")
+        try:
+            check = email_sync.test_account(trial)
+        except Exception as exc:
+            _json(handler, 400, {"error": str(exc)})
+            return
+        if not check.get("ok"):
+            _json(handler, 400, {"error": check.get("error") or "Could not sign in."})
+            return
+        saved = db.upsert_account(p)
+        _json(handler, 200, db._public_account(saved))
+        return
+    if path == "/api/oauth/microsoft/device" and method == "POST":
+        p = _read_json(handler)
+        try:
+            _json(handler, 200, oauth.start_microsoft_device(p.get("email") or "", p.get("display_name") or ""))
+        except Exception as exc:
+            _json(handler, 400, {"error": str(exc)})
+        return
+    if path == "/api/oauth/start" and method == "POST":
+        p = _read_json(handler)
+        try:
+            _json(handler, 200, oauth.start_oauth(p.get("provider") or "", p.get("email") or "", p.get("display_name") or ""))
+        except Exception as exc:
+            _json(handler, 400, {"error": str(exc)})
+        return
+    if path == "/api/oauth/status" and method == "GET":
+        state = (query.get("state") or [""])[0]
+        _json(handler, 200, oauth.pending_status(state))
+        return
+    if path.startswith("/api/accounts/") and path.endswith("/test") and method == "POST":
+        row = db.get_account(_qid(path))
+        if not row:
+            _json(handler, 404, {"error": "Account not found"})
+            return
+        try:
+            _json(handler, 200, email_sync.test_account(row))
+        except Exception as exc:
+            _json(handler, 400, {"error": str(exc)})
+        return
+    if path.startswith("/api/accounts/") and path.endswith("/default") and method == "POST":
+        row = db.set_default_account(_qid(path))
+        if not row:
+            _json(handler, 404, {"error": "Account not found"})
+            return
+        _json(handler, 200, row)
+        return
+    if path.startswith("/api/accounts/") and method == "DELETE":
+        db.delete_account(_qid(path))
+        _json(handler, 200, {"ok": True})
+        return
+
+    if path == "/api/signatures" and method == "GET":
+        _json(handler, 200, db.list_signatures())
+        return
+    if path == "/api/signatures" and method == "POST":
+        p = _read_json(handler)
+        _json(handler, 200, db.create_signature(p.get("name") or "", p.get("body") or "", bool(p.get("is_default"))))
+        return
+    if path.startswith("/api/signatures/") and path.endswith("/default") and method == "POST":
+        row = db.set_default_signature(_qid(path))
+        if not row:
+            _json(handler, 404, {"error": "Signature not found"})
+            return
+        db.set_setting("compose_signature", str(row["id"]))
+        _json(handler, 200, row)
+        return
+    if path.startswith("/api/signatures/") and method == "POST":
+        p = _read_json(handler)
+        row = db.update_signature(_qid(path), p.get("name") or "", p.get("body") or "")
+        if not row:
+            _json(handler, 404, {"error": "Signature not found"})
+            return
+        _json(handler, 200, row)
+        return
+    if path.startswith("/api/signatures/") and method == "DELETE":
+        db.delete_signature(_qid(path))
+        _json(handler, 200, {"ok": True})
+        return
+
     if path == "/api/matters" and method == "GET":
         _json(handler, 200, db.rows("SELECT * FROM matters ORDER BY status, case_no, id DESC"))
         return
@@ -378,7 +481,10 @@ def handle_api(handler: BaseHTTPRequestHandler, method: str, path: str, query: d
         return
 
     if path == "/api/mail/folders" and method == "GET":
-        stored = db.rows("SELECT * FROM folders ORDER BY role, name")
+        stored = db.rows(
+            """SELECT name, MAX(role) AS role, SUM(unseen) AS unseen
+               FROM folders GROUP BY name ORDER BY role, name"""
+        )
         if not stored:
             stored = [
                 {"name": "INBOX", "role": "inbox", "unseen": 0},
@@ -401,13 +507,24 @@ def handle_api(handler: BaseHTTPRequestHandler, method: str, path: str, query: d
                 stored.append({"name": extra, "role": extra.lower(), "unseen": c.get("unseen") or 0, "total": c.get("total") or 0})
         _json(handler, 200, stored)
         return
+    if path == "/api/mail/smart" and method == "GET":
+        _json(handler, 200, filter_counts())
+        return
 
     if path == "/api/mail" and method == "GET":
         folder = (query.get("folder") or ["INBOX"])[0]
         q = (query.get("q") or [""])[0]
         unread = (query.get("unread") or [""])[0] == "1"
         flagged = (query.get("flagged") or [""])[0] == "1"
-        items = db.search_mail(q, None if folder == "ALL" else folder)
+        label = (query.get("filter") or [""])[0] or None
+        if label in ("client", "eservice", "court"):
+            folder = "ALL"
+        items = db.search_mail(q, None if folder == "ALL" else folder, label=label)
+        for m in items:
+            tags = parse_labels(m.get("labels"))
+            if not tags:
+                tags = apply_labels(m["id"])
+            m["labels"] = tags
         if unread:
             items = [m for m in items if not m.get("seen")]
         if flagged:
@@ -434,6 +551,8 @@ def handle_api(handler: BaseHTTPRequestHandler, method: str, path: str, query: d
                 p.get("attachments") or [],
                 bool(p.get("draft")),
                 p.get("answered_id"),
+                p.get("include_signature", True),
+                p.get("account_id") or None,
             ),
         )
         return
@@ -513,6 +632,7 @@ def handle_api(handler: BaseHTTPRequestHandler, method: str, path: str, query: d
         msg["matches"] = match_matters(msg)
         msg["doc_type"] = guess_doc_type(msg, names)
         msg["doc_types"] = DOC_TYPES
+        msg["labels"] = apply_labels(mid, msg) if not parse_labels(msg.get("labels")) else parse_labels(msg.get("labels"))
         matter = db.one("SELECT * FROM matters WHERE id = ?", (msg["matter_id"],)) if msg.get("matter_id") else None
         msg["client_email"] = (matter or {}).get("client_email") or ""
         _json(handler, 200, msg)
@@ -838,6 +958,53 @@ def handle_api(handler: BaseHTTPRequestHandler, method: str, path: str, query: d
     _json(handler, 404, {"error": "Unknown API path", "path": path})
 
 
+def _oauth_html(title: str, body: str, redirect: str = "") -> bytes:
+    def esc(s: str) -> str:
+        return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    meta = f'<meta http-equiv="refresh" content="1;url={redirect}">' if redirect else ""
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">{meta}<title>{esc(title)}</title>
+    <style>body{{font-family:-apple-system,sans-serif;padding:48px;max-width:32rem}}</style></head>
+    <body><h1>{esc(title)}</h1><p>{esc(body)}</p></body></html>""".encode("utf-8")
+
+
+def _oauth_callback(handler: BaseHTTPRequestHandler, path: str, query: dict) -> None:
+    provider = "gmail" if "google" in path else "microsoft" if "microsoft" in path else ""
+    err = (query.get("error_description") or query.get("error") or [""])[0]
+    state = (query.get("state") or [""])[0]
+    code = (query.get("code") or [""])[0]
+    if err:
+        oauth.mark_oauth_error(state, err)
+        html = _oauth_html("Sign-in did not finish", err)
+        handler.send_response(400)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Length", str(len(html)))
+        handler.end_headers()
+        handler.wfile.write(html)
+        return
+    try:
+        if not provider or not code:
+            raise ValueError("Missing sign-in response from the provider.")
+        saved = oauth.finish_oauth(provider, code, state)
+        try:
+            email_sync.test_account(saved)
+        except Exception:
+            pass
+        html = _oauth_html(
+            "Account added",
+            f"{saved.get('email')} is connected. This window can close.",
+            "/?added=1",
+        )
+        handler.send_response(200)
+    except Exception as exc:
+        oauth.mark_oauth_error(state, str(exc))
+        html = _oauth_html("Sign-in failed", str(exc))
+        handler.send_response(400)
+    handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Content-Length", str(len(html)))
+    handler.end_headers()
+    handler.wfile.write(html)
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "Praecipe/1.0"
 
@@ -858,6 +1025,9 @@ class Handler(BaseHTTPRequestHandler):
         path = unquote(parsed.path)
         query = parse_qs(parsed.query)
         try:
+            if path.startswith("/oauth/"):
+                _oauth_callback(self, path, query)
+                return
             if path.startswith("/api/"):
                 handle_api(self, method, path, query)
                 return
@@ -901,11 +1071,16 @@ def _poll_loop() -> None:
     time.sleep(15)
     while True:
         try:
-            if email_sync.configured():
-                email_sync.sync_all()
-        except Exception:
-            traceback.print_exc()
-        time.sleep(120)
+            interval = int(db.setting("check_interval") or "120")
+        except ValueError:
+            interval = 120
+        if interval > 0:
+            try:
+                if email_sync.configured():
+                    email_sync.sync_all()
+            except Exception:
+                traceback.print_exc()
+        time.sleep(interval if interval > 0 else 30)
 
 
 def main() -> None:

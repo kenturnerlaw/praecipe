@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from . import db
+from . import oauth
+from .labels import apply_labels
 from .paths import MAIL_FILES, ensure_dirs
 
 _sync_lock = threading.Lock()
@@ -92,25 +94,62 @@ def _sent_iso(msg: email.message.Message) -> str:
 
 
 def configured() -> bool:
-    return bool(db.setting("imap_host") and db.setting("imap_user") and db.setting("imap_password"))
+    return bool(db.enabled_accounts())
 
 
-def _imap() -> imaplib.IMAP4:
-    host = db.setting("imap_host")
-    port = int(db.setting("imap_port") or "993")
-    user = db.setting("imap_user")
-    password = db.setting("imap_password")
-    timeout = 60
-    if db.setting("imap_tls", "ssl") == "none":
-        client: imaplib.IMAP4 = imaplib.IMAP4(host, port, timeout=timeout)
-    else:
-        client = imaplib.IMAP4_SSL(host, port, timeout=timeout)
+def _account(account: Any = None) -> dict[str, Any]:
+    if isinstance(account, dict):
+        return account
+    if account:
+        row = db.get_account(int(account))
+        if row:
+            return row
+    row = db.default_account()
+    if not row:
+        raise RuntimeError("Add a Gmail, Microsoft, or iCloud account in Settings.")
+    return row
+
+
+def _imap(account: Any = None) -> imaplib.IMAP4:
+    acct = _account(account)
+    host = acct.get("imap_host")
+    port = int(acct.get("imap_port") or "993")
+    user = acct.get("imap_user") or acct.get("email")
+    users = [user]
+    if (acct.get("provider") or "") == "icloud" and user and "@" in user:
+        users.append(user.split("@")[0])
+    last: Exception | None = None
+    for u in users:
+        client: imaplib.IMAP4 = imaplib.IMAP4_SSL(host, port, timeout=60)
+        try:
+            _imap_auth(client, acct, u)
+            try:
+                client.enable("UTF8=ACCEPT")
+            except Exception:
+                pass
+            return client
+        except Exception as exc:
+            last = exc
+            try:
+                client.logout()
+            except Exception:
+                pass
+    raise last or RuntimeError("IMAP sign-in failed.")
+
+
+def _imap_auth(client: imaplib.IMAP4, acct: dict[str, Any], user: str) -> None:
+    if (acct.get("auth_type") or "") == "oauth":
+        token = oauth.access_token(acct)
+
+        def _auth(_challenge: bytes) -> str:
+            return oauth.xoauth2(user, token)
+
+        client.authenticate("XOAUTH2", _auth)
+        return
+    password = acct.get("imap_password") or ""
+    if not password:
+        raise RuntimeError("This account has no password. Sign in again or paste an app password.")
     client.login(user, password)
-    try:
-        client.enable("UTF8=ACCEPT")
-    except Exception:
-        pass
-    return client
 
 
 def _parse_list_line(raw: bytes) -> Optional[dict[str, str]]:
@@ -185,9 +224,12 @@ def harvest_addresses(*headers: str) -> None:
             )
 
 
-def _store_message(folder: str, uid: str, flags: list[str], msg: email.message.Message) -> Optional[int]:
-    mid = _decode(msg.get("Message-ID") or "") or f"imap-{folder}-{uid}"
-    existing = db.one("SELECT id FROM messages WHERE folder = ? AND message_id = ?", (folder, mid))
+def _store_message(folder: str, uid: str, flags: list[str], msg: email.message.Message, account_id: int = 1) -> Optional[int]:
+    mid = _decode(msg.get("Message-ID") or "") or f"imap-{account_id}-{folder}-{uid}"
+    existing = db.one(
+        "SELECT id FROM messages WHERE account_id = ? AND folder = ? AND message_id = ?",
+        (account_id, folder, mid),
+    )
     text, html, files = _body_and_files(msg)
     snippet = " ".join((text or re.sub("<[^>]+>", " ", html or "")).split())[:280]
     seen = 1 if "seen" in flags else 0
@@ -256,9 +298,9 @@ def _store_message(folder: str, uid: str, flags: list[str], msg: email.message.M
             """INSERT INTO messages
                (imap_uid, folder, message_id, in_reply_to, references_header, from_addr, to_addr,
                 cc_addr, bcc_addr, reply_to, subject, sent_at, snippet, body_text, body_html, flags,
-                has_attachments, seen, flagged, draft, answered, synced_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            payload,
+                has_attachments, seen, flagged, draft, answered, synced_at, account_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            payload + (account_id,),
         )
         folder_dir = MAIL_FILES / str(msg_id)
         if files:
@@ -274,13 +316,16 @@ def _store_message(folder: str, uid: str, flags: list[str], msg: email.message.M
             )
     db.fts_upsert(msg_id)
     harvest_addresses(_addr(msg, "From"), _addr(msg, "To"), _addr(msg, "Cc"))
+    apply_labels(msg_id)
     return msg_id if not existing else None
 
 
-def list_folders(client: Optional[imaplib.IMAP4] = None) -> list[dict[str, str]]:
+def list_folders(client: Optional[imaplib.IMAP4] = None, account: Any = None) -> list[dict[str, str]]:
+    acct = _account(account) if account or db.default_account() else None
+    aid = int((acct or {}).get("id") or 1)
     own = client is None
     if own:
-        client = _imap()
+        client = _imap(acct)
     try:
         typ, data = client.list()
         folders = []
@@ -295,10 +340,10 @@ def list_folders(client: Optional[imaplib.IMAP4] = None) -> list[dict[str, str]]
             folders.insert(0, {"name": "INBOX", "delimiter": "/", "attrs": "", "role": "inbox"})
         for f in folders:
             db.execute(
-                """INSERT INTO folders(name, role, delimiter, attrs, last_uid, unseen)
-                   VALUES (?, ?, ?, ?, 0, 0)
-                   ON CONFLICT(name) DO UPDATE SET role=excluded.role, delimiter=excluded.delimiter, attrs=excluded.attrs""",
-                (f["name"], f["role"], f["delimiter"], f["attrs"]),
+                """INSERT INTO folders(account_id, name, role, delimiter, attrs, last_uid, unseen)
+                   VALUES (?, ?, ?, ?, ?, 0, 0)
+                   ON CONFLICT(account_id, name) DO UPDATE SET role=excluded.role, delimiter=excluded.delimiter, attrs=excluded.attrs""",
+                (aid, f["name"], f["role"], f["delimiter"], f["attrs"]),
             )
         return folders
     finally:
@@ -309,12 +354,14 @@ def list_folders(client: Optional[imaplib.IMAP4] = None) -> list[dict[str, str]]
                 pass
 
 
-def _sync_folder(client: imaplib.IMAP4, folder: str, limit: int) -> int:
+def _sync_folder(client: imaplib.IMAP4, folder: str, limit: int, account: Any = None) -> int:
+    acct = _account(account) if account or db.default_account() else {"id": 1}
+    aid = int(acct.get("id") or 1)
     quoted = _quote_folder(folder)
     typ, _ = client.select(quoted, readonly=True)
     if typ != "OK":
         return 0
-    row = db.one("SELECT last_uid FROM folders WHERE name = ?", (folder,))
+    row = db.one("SELECT last_uid FROM folders WHERE account_id = ? AND name = ?", (aid, folder,))
     last_uid = int((row or {}).get("last_uid") or 0)
     typ, data = client.uid("search", None, "ALL")
     if typ != "OK" or not data or not data[0]:
@@ -324,10 +371,13 @@ def _sync_folder(client: imaplib.IMAP4, folder: str, limit: int) -> int:
         new_uids = [u for u in uids if u > last_uid]
         if not new_uids:
             unseen = db.one(
-                "SELECT COUNT(*) AS n FROM messages WHERE folder = ? AND seen = 0 AND deleted = 0",
-                (folder,),
+                "SELECT COUNT(*) AS n FROM messages WHERE account_id = ? AND folder = ? AND seen = 0 AND deleted = 0",
+                (aid, folder),
             )
-            db.execute("UPDATE folders SET unseen = ? WHERE name = ?", ((unseen or {}).get("n") or 0, folder))
+            db.execute(
+                "UPDATE folders SET unseen = ? WHERE account_id = ? AND name = ?",
+                ((unseen or {}).get("n") or 0, aid, folder),
+            )
             return 0
         uids = new_uids
     else:
@@ -350,48 +400,61 @@ def _sync_folder(client: imaplib.IMAP4, folder: str, limit: int) -> int:
             continue
         flags = _parse_flags(meta)
         msg = email.message_from_bytes(raw)
-        if _store_message(folder, str(uid), flags, msg) is not None:
+        if _store_message(folder, str(uid), flags, msg, aid) is not None:
             added += 1
         max_uid = max(max_uid, uid)
     unseen = db.one(
-        "SELECT COUNT(*) AS n FROM messages WHERE folder = ? AND seen = 0 AND deleted = 0",
-        (folder,),
+        "SELECT COUNT(*) AS n FROM messages WHERE account_id = ? AND folder = ? AND seen = 0 AND deleted = 0",
+        (aid, folder),
     )
     db.execute(
-        """INSERT INTO folders(name, last_uid, unseen) VALUES (?, ?, ?)
-           ON CONFLICT(name) DO UPDATE SET last_uid=excluded.last_uid, unseen=excluded.unseen""",
-        (folder, max_uid, (unseen or {}).get("n") or 0),
+        """INSERT INTO folders(account_id, name, last_uid, unseen) VALUES (?, ?, ?, ?)
+           ON CONFLICT(account_id, name) DO UPDATE SET last_uid=excluded.last_uid, unseen=excluded.unseen""",
+        (aid, folder, max_uid, (unseen or {}).get("n") or 0),
     )
     return added
 
 
 def sync_all(limit: int = 250) -> dict[str, Any]:
-    if not configured():
-        return {"ok": False, "error": "IMAP is not configured. Open Settings and add your mail host.", "added": 0}
+    accounts = db.enabled_accounts()
+    if not accounts:
+        return {"ok": False, "error": "Add a Gmail, Microsoft, or iCloud account in Settings.", "added": 0}
     if not _sync_lock.acquire(blocking=False):
         return {"ok": True, "added": 0, "busy": True}
     ensure_dirs()
+    added = 0
+    synced: list[str] = []
+    errors: list[str] = []
     try:
-        client = _imap()
-        try:
-            folders = list_folders(client)
-            added = 0
-            synced = []
-            for f in folders:
-                if f.get("role") in ("junk", "trash", "archive"):
-                    continue
-                cap = limit if f.get("role") in ("inbox", "sent", "") or f["name"].upper() == "INBOX" else min(80, limit)
-                n = _sync_folder(client, f["name"], cap)
-                added += n
-                synced.append(f["name"])
-            total = db.one("SELECT COUNT(*) AS n FROM messages WHERE deleted = 0")["n"]
-            unseen = db.one("SELECT COUNT(*) AS n FROM messages WHERE seen = 0 AND deleted = 0")["n"]
-            return {"ok": True, "added": added, "total": total, "unseen": unseen, "folders": synced}
-        finally:
+        for acct in accounts:
             try:
-                client.logout()
-            except Exception:
-                pass
+                client = _imap(acct)
+            except Exception as exc:
+                errors.append(f"{acct.get('email')}: {exc}")
+                continue
+            try:
+                folders = list_folders(client, acct)
+                for f in folders:
+                    if f.get("role") in ("junk", "trash", "archive"):
+                        continue
+                    cap = limit if f.get("role") in ("inbox", "sent", "") or f["name"].upper() == "INBOX" else min(80, limit)
+                    n = _sync_folder(client, f["name"], cap, acct)
+                    added += n
+                    synced.append(f"{acct.get('email')} {f['name']}")
+            finally:
+                try:
+                    client.logout()
+                except Exception:
+                    pass
+        total = db.one("SELECT COUNT(*) AS n FROM messages WHERE deleted = 0")["n"]
+        unseen = db.one("SELECT COUNT(*) AS n FROM messages WHERE seen = 0 AND deleted = 0")["n"]
+        out: dict[str, Any] = {"ok": not errors or added > 0, "added": added, "total": total, "unseen": unseen, "folders": synced}
+        if errors:
+            out["error"] = "; ".join(errors)
+            out["ok"] = out["ok"] and not (added == 0 and errors)
+            if added == 0:
+                out["ok"] = False
+        return out
     finally:
         _sync_lock.release()
 
@@ -400,8 +463,8 @@ def sync_inbox(limit: int = 250) -> dict[str, Any]:
     return sync_all(limit)
 
 
-def _with_writable(folder: str):
-    client = _imap()
+def _with_writable(folder: str, account: Any = None):
+    client = _imap(account)
     typ, _ = client.select(_quote_folder(folder), readonly=False)
     if typ != "OK":
         try:
@@ -417,8 +480,9 @@ def set_flag(message_local_id: int, flag: str, add: bool = True) -> dict[str, An
     if not msg:
         return {"ok": False, "error": "Message not found"}
     imap_flag = {"seen": "\\Seen", "flagged": "\\Flagged", "deleted": "\\Deleted", "answered": "\\Answered"}.get(flag)
-    if msg.get("imap_uid") and configured() and imap_flag and msg.get("folder") not in ("SENT", "DRAFTS"):
-        client = _with_writable(msg["folder"])
+    acct = db.get_account(msg.get("account_id") or 0) if msg.get("account_id") else db.default_account()
+    if msg.get("imap_uid") and acct and imap_flag and msg.get("folder") not in ("SENT", "DRAFTS"):
+        client = _with_writable(msg["folder"], acct)
         try:
             op = "+FLAGS" if add else "-FLAGS"
             client.uid("store", str(msg["imap_uid"]), op, f"({imap_flag})")
@@ -436,9 +500,10 @@ def delete_message(message_local_id: int) -> dict[str, Any]:
     msg = db.one("SELECT * FROM messages WHERE id = ?", (message_local_id,))
     if not msg:
         return {"ok": False, "error": "Message not found"}
-    trash = db.one("SELECT name FROM folders WHERE role = 'trash'")
-    if msg.get("imap_uid") and configured() and msg.get("folder") not in ("SENT", "DRAFTS"):
-        client = _with_writable(msg["folder"])
+    trash = db.one("SELECT name FROM folders WHERE role = 'trash' AND account_id = ?", (msg.get("account_id") or 1,))
+    acct = db.get_account(msg.get("account_id") or 0) if msg.get("account_id") else db.default_account()
+    if msg.get("imap_uid") and acct and msg.get("folder") not in ("SENT", "DRAFTS"):
+        client = _with_writable(msg["folder"], acct)
         try:
             if trash:
                 try:
@@ -460,14 +525,22 @@ def delete_message(message_local_id: int) -> dict[str, Any]:
 
 
 def _own_address() -> str:
+    acct = db.default_account()
+    if acct:
+        return (acct.get("email") or "").lower()
     return (db.setting("email_address") or db.setting("imap_user") or "").lower()
 
 
-def _append_sent(raw: bytes) -> None:
-    sent = db.one("SELECT name FROM folders WHERE role = 'sent'")
-    if not sent or not configured():
+def _append_sent(raw: bytes, account: Any = None) -> None:
+    acct = _account(account) if configured() else None
+    if not acct:
         return
-    client = _imap()
+    sent = db.one("SELECT name FROM folders WHERE role = 'sent' AND account_id = ?", (acct["id"],))
+    if not sent:
+        sent = db.one("SELECT name FROM folders WHERE role = 'sent'")
+    if not sent:
+        return
+    client = _imap(acct)
     try:
         client.append(_quote_folder(sent["name"]), "(\\Seen)", None, raw)
     except Exception:
@@ -477,6 +550,20 @@ def _append_sent(raw: bytes) -> None:
             client.logout()
         except Exception:
             pass
+
+
+def _smtp_auth(smtp: smtplib.SMTP, acct: dict[str, Any], user: str) -> None:
+    if (acct.get("auth_type") or "") == "oauth":
+        import base64
+
+        token = oauth.access_token(acct)
+        raw = oauth.xoauth2(user, token)
+        code, resp = smtp.docmd("AUTH", "XOAUTH2 " + base64.b64encode(raw.encode("utf-8")).decode("ascii"))
+        if code != 235:
+            raise smtplib.SMTPAuthenticationError(code, resp)
+        return
+    password = acct.get("smtp_password") or acct.get("imap_password") or ""
+    smtp.login(user, password)
 
 
 def send_mail(
@@ -491,12 +578,21 @@ def send_mail(
     attachments: Optional[list[dict[str, Any]]] = None,
     save_draft: bool = False,
     reply_all_answered_id: Optional[int] = None,
+    include_signature: bool = True,
+    account_id: Optional[int] = None,
 ) -> dict[str, Any]:
-    from_addr = db.setting("email_address") or db.setting("imap_user")
-    display = db.setting("display_name") or from_addr or ""
-    signature = db.setting("signature")
-    if signature and signature not in (body or ""):
-        body = (body or "").rstrip() + "\n\n" + signature
+    acct = db.get_account(int(account_id)) if account_id else db.default_account()
+    from_addr = (acct or {}).get("email") or db.setting("email_address") or db.setting("imap_user")
+    display = (acct or {}).get("display_name") or db.setting("display_name") or from_addr or ""
+    signature = ""
+    if include_signature and not save_draft:
+        signature = db.default_signature()
+        if db.setting("append_signature", "1") != "0" and signature and signature not in (body or ""):
+            body = (body or "").rstrip() + "\n\n" + signature
+    if db.setting("bcc_self", "0") == "1" and not save_draft:
+        own = (from_addr or "").lower()
+        if own and own not in (bcc or "").lower() and own not in (to_addr or "").lower():
+            bcc = f"{bcc}, {from_addr}" if bcc else from_addr
 
     msg = EmailMessage()
     msgid = make_msgid(domain=(from_addr.split("@")[-1] if from_addr and "@" in from_addr else "localhost"))
@@ -529,21 +625,20 @@ def send_mail(
         msg.add_attachment(data, maintype=main, subtype=sub, filename=filename)
 
     if save_draft:
-        local_id = _save_local(msg, "DRAFTS", to_addr, cc, bcc, subject, body, matter_id, True, attachments or [])
+        local_id = _save_local(msg, "DRAFTS", to_addr, cc, bcc, subject, body, matter_id, True, attachments or [], (acct or {}).get("id"))
         return {"ok": True, "id": local_id, "draft": True}
 
-    host = db.setting("smtp_host")
-    if not host:
-        return {"ok": False, "error": "SMTP is not configured."}
-    port = int(db.setting("smtp_port") or "587")
-    user = db.setting("smtp_user") or db.setting("imap_user")
-    password = db.setting("smtp_password") or db.setting("imap_password")
-    mode = db.setting("smtp_tls", "starttls")
+    if not acct or not acct.get("smtp_host"):
+        return {"ok": False, "error": "SMTP is not configured. Add the account in Settings."}
+    host = acct.get("smtp_host")
+    port = int(acct.get("smtp_port") or "587")
+    user = acct.get("smtp_user") or acct.get("imap_user") or from_addr
+    mode = acct.get("smtp_tls") or "starttls"
     ctx = ssl.create_default_context()
     recipients = [a for _, a in getaddresses([to_addr, cc, bcc]) if a]
     if mode == "ssl" or port == 465:
         with smtplib.SMTP_SSL(host, port, context=ctx, timeout=30) as smtp:
-            smtp.login(user, password)
+            _smtp_auth(smtp, acct, user)
             smtp.send_message(msg, from_addr=from_addr, to_addrs=recipients)
     else:
         with smtplib.SMTP(host, port, timeout=30) as smtp:
@@ -551,12 +646,12 @@ def send_mail(
             if mode != "none":
                 smtp.starttls(context=ctx)
                 smtp.ehlo()
-            smtp.login(user, password)
+            _smtp_auth(smtp, acct, user)
             smtp.send_message(msg, from_addr=from_addr, to_addrs=recipients)
 
     raw = msg.as_bytes()
-    _append_sent(raw)
-    local_id = _save_local(msg, "SENT", to_addr, cc, bcc, subject, body, matter_id, False, attachments or [])
+    _append_sent(raw, acct)
+    local_id = _save_local(msg, "SENT", to_addr, cc, bcc, subject, body, matter_id, False, attachments or [], acct.get("id"))
     if reply_all_answered_id:
         set_flag(int(reply_all_answered_id), "answered", True)
     return {"ok": True, "id": local_id}
@@ -573,13 +668,14 @@ def _save_local(
     matter_id: Optional[int],
     draft: bool,
     attachments: list[dict[str, Any]],
+    account_id: Optional[int] = None,
 ) -> int:
     msgid = msg.get("Message-ID") or f"local-{db.utcnow()}"
     msg_id = db.execute(
         """INSERT INTO messages
            (folder, message_id, in_reply_to, references_header, from_addr, to_addr, cc_addr, bcc_addr,
-            subject, sent_at, snippet, body_text, flags, matter_id, has_attachments, seen, draft, synced_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)""",
+            subject, sent_at, snippet, body_text, flags, matter_id, has_attachments, seen, draft, synced_at, account_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)""",
         (
             folder,
             msgid,
@@ -598,6 +694,7 @@ def _save_local(
             1 if attachments else 0,
             1 if draft else 0,
             db.utcnow(),
+            account_id,
         ),
     )
     if attachments:
@@ -621,7 +718,23 @@ def _save_local(
             )
     db.fts_upsert(msg_id)
     harvest_addresses(to_addr, cc, bcc)
+    apply_labels(msg_id)
     return msg_id
+
+
+def test_account(account: Any) -> dict[str, Any]:
+    acct = account if isinstance(account, dict) else _account(account)
+    client = _imap(acct)
+    try:
+        typ, _ = client.select("INBOX", readonly=True)
+        if typ != "OK":
+            return {"ok": False, "error": "Signed in, but the Inbox would not open. Enable IMAP for this mailbox."}
+        return {"ok": True, "email": acct.get("email"), "provider": acct.get("provider")}
+    finally:
+        try:
+            client.logout()
+        except Exception:
+            pass
 
 
 def quote_original(msg: dict[str, Any], mode: str) -> dict[str, str]:
@@ -660,6 +773,7 @@ def quote_original(msg: dict[str, Any], mode: str) -> dict[str, str]:
         "in_reply_to": msg.get("message_id") or "",
         "references": refs,
         "matter_id": msg.get("matter_id") or "",
+        "account_id": msg.get("account_id") or "",
     }
 
 
