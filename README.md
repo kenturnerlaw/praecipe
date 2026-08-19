@@ -25,3 +25,15 @@ Open [http://127.0.0.1:12090](http://127.0.0.1:12090).
 Keys: `N` new · `R` reply · `A` reply all · `F` forward · `Del` delete · `J`/`K` next/previous · `U` unread · `/` search.
 
 Time CSV is on the Time pane. Calendar `.ics` is on Calendar.
+
+## iPhone app
+
+Open [`ios/Praecipe.xcodeproj`](ios/Praecipe.xcodeproj) in Xcode (26.3+). Scheme **Praecipe**, bundle id `com.kenturnerlaw.praecipe`.
+
+1. Select your Team under Signing & Capabilities.
+2. Run on a simulator or a plugged-in iPhone.
+3. In **Settings**, add Gmail / iCloud / Yahoo / Microsoft 365 with an **app password**.
+4. Tap **Get Mail**. File & Bill is on the open message. **Rules** counts Fla. Fam. L. R. P. 12.090 / Rule 2.514 onto the calendar.
+
+The Mac Python app (`python3 praecipe.py`) stays in this repo. Mail passwords live in the iOS Keychain, not in git.
+
