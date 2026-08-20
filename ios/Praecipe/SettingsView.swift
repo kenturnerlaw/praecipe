@@ -10,6 +10,8 @@ struct SettingsView: View {
     @State private var display = ""
     @State private var password = ""
     @State private var imapUser = ""
+    @State private var signInError = ""
+    @State private var isSigningIn = false
 
     var body: some View {
         Form {
@@ -43,8 +45,15 @@ struct SettingsView: View {
                     TextField("IMAP user (often the part before @)", text: $imapUser).textInputAutocapitalization(.never)
                 }
                 SecureField("App password", text: $password)
-                Button("Add account") { addAccount() }
-                    .disabled(email.isEmpty || password.isEmpty)
+                if !signInError.isEmpty {
+                    Text(signInError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                }
+                Button(isSigningIn ? "Signing in…" : "Test and add account") {
+                    Task { await addAccount() }
+                }
+                .disabled(email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || normalizedPassword.isEmpty || isSigningIn)
             }
             Section("Signature") {
                 ForEach(signatures) { s in
@@ -61,27 +70,68 @@ struct SettingsView: View {
         .onChange(of: provider.id) { _, _ in
             email = ""
             password = ""
+            signInError = ""
         }
     }
 
-    private func addAccount() {
-        let a = MailAccount(provider: provider.id, email: email, displayName: display)
+    @MainActor
+    private func addAccount() async {
+        let cleanEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let cleanUser = imapUser.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = cleanUser.isEmpty ? cleanEmail : cleanUser
+        let cleanPassword = normalizedPassword
+        signInError = ""
+        isSigningIn = true
+        defer { isSigningIn = false }
+
+        do {
+            try await MailTransport().testIMAP(
+                host: provider.imapHost,
+                port: Int(provider.imapPort) ?? 993,
+                user: user,
+                password: cleanPassword
+            )
+        } catch {
+            signInError = error.localizedDescription
+            return
+        }
+
+        if let existing = accounts.first(where: { $0.email.caseInsensitiveCompare(cleanEmail) == .orderedSame }) {
+            KeychainStore.savePassword(cleanPassword, account: existing.email)
+            existing.displayName = display.trimmingCharacters(in: .whitespacesAndNewlines)
+            existing.imapUser = user
+            existing.enabled = true
+            existing.isDefault = true
+            for other in accounts where other !== existing { other.isDefault = false }
+            clearAccountForm()
+            return
+        }
+
+        let a = MailAccount(provider: provider.id, email: cleanEmail, displayName: display.trimmingCharacters(in: .whitespacesAndNewlines))
         a.imapHost = provider.imapHost
         a.imapPort = provider.imapPort
         a.smtpHost = provider.smtpHost
         a.smtpPort = provider.smtpPort
         a.smtpTLS = provider.smtpTLS
-        a.imapUser = imapUser.isEmpty ? email : imapUser
-        a.smtpUser = email
-        a.isDefault = accounts.isEmpty
+        a.imapUser = user
+        a.smtpUser = cleanEmail
         for other in accounts { other.isDefault = false }
         a.isDefault = true
         context.insert(a)
-        KeychainStore.savePassword(password, account: email)
+        KeychainStore.savePassword(cleanPassword, account: cleanEmail)
+        clearAccountForm()
+    }
+
+    private var normalizedPassword: String {
+        password.filter { !$0.isWhitespace }
+    }
+
+    private func clearAccountForm() {
         email = ""
         password = ""
         display = ""
         imapUser = ""
+        signInError = ""
     }
 }
 

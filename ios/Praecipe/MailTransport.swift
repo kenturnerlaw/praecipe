@@ -20,6 +20,17 @@ struct IMAPEnvelope {
 
 /// IMAP (993 TLS) and SMTP (465 SSL or 587 STARTTLS) for app-password accounts.
 actor MailTransport {
+    func testIMAP(host: String, port: Int, user: String, password: String) async throws {
+        let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
+        defer { conn.close() }
+        _ = try conn.readLine()
+        try imapLogin(conn, user: user, password: password)
+        guard try imapOK(conn, "SELECT INBOX") else {
+            throw MailError.protocolFailure("Signed in, but the Inbox could not be opened. Check that IMAP is enabled for this mailbox.")
+        }
+        _ = try? conn.command("LOGOUT")
+    }
+
     func fetchLatest(host: String, port: Int, user: String, password: String, folder: String, afterUID: Int, limit: Int = 50) async throws -> (Bool, [IMAPEnvelope], [String]) {
         let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
         defer { conn.close() }
