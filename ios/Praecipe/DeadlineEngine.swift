@@ -151,7 +151,7 @@ enum DeadlineEngine {
     }
 
     private static func nthWeekday(_ year: Int, _ month: Int, _ weekday: Int, _ n: Int) -> DateComponents {
-        var c = DateComponents(year: year, month: month, weekday: weekday, weekdayOrdinal: n)
+        let c = DateComponents(year: year, month: month, weekday: weekday, weekdayOrdinal: n)
         if let d = Calendar.current.date(from: c) {
             return Calendar.current.dateComponents([.year, .month, .day], from: d)
         }
@@ -159,11 +159,10 @@ enum DeadlineEngine {
     }
 
     private static func lastWeekday(_ year: Int, _ month: Int, _ weekday: Int) -> DateComponents {
-        var c = DateComponents(year: year, month: month, weekday: weekday, weekdayOrdinal: -1)
+        let c = DateComponents(year: year, month: month, weekday: weekday, weekdayOrdinal: -1)
         if let d = Calendar.current.date(from: c) {
             return Calendar.current.dateComponents([.year, .month, .day], from: d)
         }
         return c
     }
 }
-

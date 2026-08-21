@@ -33,7 +33,7 @@ struct MailProvider: Identifiable {
             smtpPort: "587",
             smtpTLS: "starttls",
             appPasswordURL: nil,
-            help: "Work or school mailbox. Use IMAP with an app password if your tenant allows it, or add the account after enabling IMAP in the admin center."
+            help: "Work or school mailbox. Sign in securely with Microsoft; Praecipe never receives or stores your Microsoft password."
         ),
         MailProvider(
             id: "icloud",
@@ -65,8 +65,10 @@ struct MailProvider: Identifiable {
 enum KeychainStore {
     private static let service = "com.kenturnerlaw.praecipe"
 
-    static func savePassword(_ password: String, account: String) {
-        let data = Data(password.utf8)
+    static func savePassword(_ password: String, account: String) { saveSecret(password, account: account) }
+
+    static func saveSecret(_ secret: String, account: String) {
+        let data = Data(secret.utf8)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -79,7 +81,9 @@ enum KeychainStore {
         SecItemAdd(add as CFDictionary, nil)
     }
 
-    static func password(account: String) -> String {
+    static func password(account: String) -> String { secret(account: account) }
+
+    static func secret(account: String) -> String {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -93,7 +97,13 @@ enum KeychainStore {
         return String(data: data, encoding: .utf8) ?? ""
     }
 
-    static func deletePassword(account: String) {
+    static func hasPassword(account: String) -> Bool {
+        !password(account: account).isEmpty
+    }
+
+    static func deletePassword(account: String) { deleteSecret(account: account) }
+
+    static func deleteSecret(account: String) {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,

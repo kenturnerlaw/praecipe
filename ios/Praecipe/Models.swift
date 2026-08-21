@@ -56,6 +56,8 @@ final class Matter {
     var rate: Double
     var notes: String
     var createdAt: Date
+    var billingExternalID: String?
+    var lawPayContactID: String?
 
     init(caseNo: String = "", style: String = "", status: String = "open") {
         self.caseNo = caseNo
@@ -72,6 +74,8 @@ final class Matter {
         self.rate = 0
         self.notes = ""
         self.createdAt = Date()
+        self.billingExternalID = nil
+        self.lawPayContactID = nil
     }
 
     var label: String {
@@ -168,6 +172,13 @@ final class TimeEntry {
     var rate: Double
     var running: Bool
     var createdAt: Date
+    var billingExternalID: String?
+    var lawPayInvoiceSourceID: String?
+    var lawPayInvoiceID: String?
+    var lawPayInvoiceNumber: String?
+    var lawPayStatus: String?
+    var lawPaySyncedAt: Date?
+    var lawPayError: String?
 
     init(minutes: Double = 0, activity: String = "email", description: String = "") {
         self.minutes = minutes
@@ -177,6 +188,13 @@ final class TimeEntry {
         self.rate = 0
         self.running = false
         self.createdAt = Date()
+        self.billingExternalID = nil
+        self.lawPayInvoiceSourceID = nil
+        self.lawPayInvoiceID = nil
+        self.lawPayInvoiceNumber = nil
+        self.lawPayStatus = nil
+        self.lawPaySyncedAt = nil
+        self.lawPayError = nil
     }
 
     var fee: Double { minutes / 60.0 * rate }
@@ -289,7 +307,7 @@ final class MailSignature {
 
 @Model
 final class AppSetting {
-    @Attribute(.unique) var key: String
+    var key: String
     var value: String
 
     init(key: String, value: String) {

@@ -20,22 +20,22 @@ struct IMAPEnvelope {
 
 /// IMAP (993 TLS) and SMTP (465 SSL or 587 STARTTLS) for app-password accounts.
 actor MailTransport {
-    func testIMAP(host: String, port: Int, user: String, password: String) async throws {
+    func testIMAP(host: String, port: Int, user: String, password: String, oauthToken: String? = nil) async throws {
         let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
         defer { conn.close() }
         _ = try conn.readLine()
-        try imapLogin(conn, user: user, password: password)
+        try imapLogin(conn, user: user, password: password, oauthToken: oauthToken)
         guard try imapOK(conn, "SELECT INBOX") else {
             throw MailError.protocolFailure("Signed in, but the Inbox could not be opened. Check that IMAP is enabled for this mailbox.")
         }
         _ = try? conn.command("LOGOUT")
     }
 
-    func fetchLatest(host: String, port: Int, user: String, password: String, folder: String, afterUID: Int, limit: Int = 50) async throws -> (Bool, [IMAPEnvelope], [String]) {
+    func fetchLatest(host: String, port: Int, user: String, password: String, oauthToken: String? = nil, folder: String, afterUID: Int, limit: Int = 50) async throws -> (Bool, [IMAPEnvelope], [String]) {
         let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
         defer { conn.close() }
         _ = try conn.readLine()
-        try imapLogin(conn, user: user, password: password)
+        try imapLogin(conn, user: user, password: password, oauthToken: oauthToken)
         let boxes = try imapList(conn)
         let selectName = boxes.first(where: { $0.caseInsensitiveCompare(folder) == .orderedSame }) ?? folder
         guard try imapOK(conn, "SELECT \(imapQuote(selectName))") else {
@@ -51,18 +51,18 @@ actor MailTransport {
         return (true, out, boxes)
     }
 
-    func setFlag(host: String, port: Int, user: String, password: String, folder: String, uid: String, flag: String, add: Bool) async throws {
+    func setFlag(host: String, port: Int, user: String, password: String, oauthToken: String? = nil, folder: String, uid: String, flag: String, add: Bool) async throws {
         let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
         defer { conn.close() }
         _ = try conn.readLine()
-        try imapLogin(conn, user: user, password: password)
+        try imapLogin(conn, user: user, password: password, oauthToken: oauthToken)
         _ = try imapOK(conn, "SELECT \(imapQuote(folder))")
         let op = add ? "+FLAGS.SILENT" : "-FLAGS.SILENT"
         _ = try conn.command("UID STORE \(uid) \(op) (\(flag))")
         _ = try? conn.command("LOGOUT")
     }
 
-    func sendMail(host: String, port: Int, tls: String, user: String, password: String, from: String, to: [String], raw: String) async throws {
+    func sendMail(host: String, port: Int, tls: String, user: String, password: String, oauthToken: String? = nil, from: String, to: [String], raw: String) async throws {
         let mode: MailStream.TLSMode = tls == "ssl" ? .implicit : .plainThenSTARTTLS
         let conn = try MailStream.connect(host: host, port: port, tls: mode)
         defer { conn.close() }
@@ -74,27 +74,46 @@ actor MailTransport {
             try conn.startTLS()
             _ = try conn.smtp("EHLO praecipe.local")
         }
-        _ = try conn.smtp("AUTH LOGIN")
-        _ = try conn.smtp(Data(user.utf8).base64EncodedString())
-        let auth = try conn.smtp(Data(password.utf8).base64EncodedString())
+        let auth: String
+        if let oauthToken, !oauthToken.isEmpty {
+            let xoauth = Data("user=\(user)\u{01}auth=Bearer \(oauthToken)\u{01}\u{01}".utf8).base64EncodedString()
+            auth = try conn.smtp("AUTH XOAUTH2 \(xoauth)")
+        } else {
+            _ = try conn.smtp("AUTH LOGIN")
+            _ = try conn.smtp(Data(user.utf8).base64EncodedString())
+            auth = try conn.smtp(Data(password.utf8).base64EncodedString())
+        }
         if !auth.hasPrefix("235") {
-            throw MailError.auth("SMTP login failed. Use an app password.")
+            let advice = oauthToken == nil ? " Check the app password." : " Open Settings and reconnect Microsoft."
+            throw MailError.auth("SMTP authentication failed.\(advice)")
         }
         let mailFrom = try conn.smtp("MAIL FROM:<\(from)>")
         if !mailFrom.hasPrefix("250") { throw MailError.protocolFailure(mailFrom) }
+        var acceptedRecipients = 0
         for addr in to where addr.contains("@") {
-            _ = try conn.smtp("RCPT TO:<\(addr)>")
+            let response = try conn.smtp("RCPT TO:<\(addr)>")
+            if response.hasPrefix("250") || response.hasPrefix("251") { acceptedRecipients += 1 }
         }
-        _ = try conn.smtp("DATA")
+        guard acceptedRecipients > 0 else { throw MailError.protocolFailure("The mail server rejected every recipient.") }
+        let dataResponse = try conn.smtp("DATA")
+        guard dataResponse.hasPrefix("354") else { throw MailError.protocolFailure("The mail server refused the message body: \(dataResponse)") }
         let escaped = raw.replacingOccurrences(of: "\n.", with: "\n..")
-        _ = try conn.smtpRaw(escaped + "\r\n.")
+        let sentResponse = try conn.smtpRaw(escaped + "\r\n.")
+        guard sentResponse.hasPrefix("250") else { throw MailError.protocolFailure("The mail server rejected the message: \(sentResponse)") }
         _ = try conn.smtp("QUIT")
     }
 
-    private func imapLogin(_ conn: MailStream, user: String, password: String) throws {
-        let r = try conn.command("LOGIN \(imapQuote(user)) \(imapQuote(password))")
-        if r.contains(" NO ") || r.contains(" BAD ") || r.hasPrefix("A") && r.contains("NO") {
-            throw MailError.auth("IMAP login failed. Use an app password, not your regular account password.")
+    private func imapLogin(_ conn: MailStream, user: String, password: String, oauthToken: String? = nil) throws {
+        let r: String
+        if let oauthToken, !oauthToken.isEmpty {
+            let xoauth = Data("user=\(user)\u{01}auth=Bearer \(oauthToken)\u{01}\u{01}".utf8).base64EncodedString()
+            r = try conn.command("AUTHENTICATE XOAUTH2 \(xoauth)")
+        } else {
+            r = try conn.command("LOGIN \(imapQuote(user)) \(imapQuote(password))")
+        }
+        guard r.components(separatedBy: "\n").last(where: { !$0.isEmpty })?.contains(" OK ") == true else {
+            let advice = oauthToken == nil ? " Check the app password, not the regular account password." : " Open Settings and reconnect Microsoft."
+            throw MailError.auth("IMAP authentication failed.\(advice)")
         }
     }
 

@@ -10,7 +10,11 @@ struct PraecipeApp: App {
             TimeEntry.self, PracticeNote.self, CalendarEvent.self, MatterFile.self,
             Person.self, MailSignature.self, AppSetting.self,
         ])
+        #if PRAECIPE_ICLOUD
+        let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false, cloudKitDatabase: .automatic)
+        #else
         let config = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
+        #endif
         do {
             return try ModelContainer(for: schema, configurations: [config])
         } catch {
@@ -30,6 +34,7 @@ enum AppStore {
     static let filesRoot: URL = {
         let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("matters", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
         return url
     }()
 

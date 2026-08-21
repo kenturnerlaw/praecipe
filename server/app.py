@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import base64
 import csv
+import hmac
 import io
 import json
 import mimetypes
+import os
 import posixpath
 import re
 import threading
@@ -18,14 +20,15 @@ from urllib.request import Request, urlopen
 from . import db
 from . import deadlines as rules
 from . import email_sync
+from . import lawpay
 from . import oauth
 from .extract import extract
 from .labels import apply_labels, filter_counts, parse_labels
 from .match import DOC_TYPES, guess_doc_type, match_matters
 from .paths import FILES, MATTER_FILES, PUBLIC, ROOT, ensure_dirs
 
-HOST = "127.0.0.1"
-PORT = 12090
+HOST = os.environ.get("PRAECIPE_HOST", "127.0.0.1")
+PORT = int(os.environ.get("PRAECIPE_PORT", "12090"))
 
 
 def _json(handler: BaseHTTPRequestHandler, code: int, payload: object) -> None:
@@ -60,6 +63,22 @@ def _send_bytes(handler: BaseHTTPRequestHandler, data: bytes, filename: str, cty
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def _lawpay_authorized(handler: BaseHTTPRequestHandler) -> bool:
+    """LawPay routes may be local-only or protected by a dedicated API token."""
+    expected = os.environ.get("PRAECIPE_API_TOKEN", "").strip()
+    if expected:
+        supplied = handler.headers.get("Authorization", "")
+        return hmac.compare_digest(supplied, f"Bearer {expected}")
+    return handler.client_address[0] in {"127.0.0.1", "::1"}
+
+
+def _lawpay_error(handler: BaseHTTPRequestHandler, exc: lawpay.LawPayError) -> None:
+    payload: dict[str, object] = {"error": str(exc)}
+    if exc.details is not None:
+        payload["details"] = exc.details
+    _json(handler, exc.status, payload)
 
 
 def download_url(url: str, matter_id: int | None, message_id: int | None = None, doc_type: str = "service") -> dict:
@@ -315,6 +334,39 @@ def handle_api(handler: BaseHTTPRequestHandler, method: str, path: str, query: d
     if path == "/api/health" and method == "GET":
         unseen = db.one("SELECT COUNT(*) AS n FROM messages WHERE seen = 0 AND deleted = 0")
         _json(handler, 200, {"ok": True, "name": "Praecipe", "port": PORT, "unseen": (unseen or {}).get("n") or 0})
+        return
+
+    if path.startswith("/api/lawpay/"):
+        if not _lawpay_authorized(handler):
+            _json(handler, 401, {"error": "This Praecipe server did not accept the API token."})
+            return
+        try:
+            if path == "/api/lawpay/status" and method == "GET":
+                _json(handler, 200, lawpay.status(db.setting("lawpay_bank_account_id")))
+                return
+            if path == "/api/lawpay/connect" and method == "POST":
+                _json(handler, 200, {"authorization_url": lawpay.new_authorization()})
+                return
+            if path == "/api/lawpay/bank-account" and method == "POST":
+                bank_account_id = str(_read_json(handler).get("bank_account_id") or "").strip()
+                accounts = lawpay.bank_accounts()
+                if not any(item.get("id") == bank_account_id for item in accounts):
+                    _json(handler, 400, {"error": "Choose a bank account returned by LawPay."})
+                    return
+                db.set_setting("lawpay_bank_account_id", bank_account_id)
+                _json(handler, 200, lawpay.status(bank_account_id))
+                return
+            if path == "/api/lawpay/invoices" and method == "POST":
+                result = lawpay.create_invoice(
+                    _read_json(handler),
+                    default_bank_account_id=db.setting("lawpay_bank_account_id"),
+                )
+                _json(handler, 200, result)
+                return
+        except lawpay.LawPayError as exc:
+            _lawpay_error(handler, exc)
+            return
+        _json(handler, 404, {"error": "LawPay route not found."})
         return
 
     if path == "/api/settings" and method == "GET":
@@ -968,6 +1020,30 @@ def _oauth_html(title: str, body: str, redirect: str = "") -> bytes:
 
 
 def _oauth_callback(handler: BaseHTTPRequestHandler, path: str, query: dict) -> None:
+    if "lawpay" in path:
+        err = (query.get("error_description") or query.get("error") or [""])[0]
+        state = (query.get("state") or [""])[0]
+        code = (query.get("code") or [""])[0]
+        try:
+            if err:
+                raise lawpay.LawPayError(err, 400)
+            if not code or not state:
+                raise lawpay.LawPayError("LawPay did not return a complete authorization response.", 400)
+            lawpay.exchange_authorization_code(code, state)
+            html = _oauth_html(
+                "LawPay connected",
+                "Praecipe can now create LawPay invoices. Return to Praecipe and choose the deposit account.",
+            )
+            handler.send_response(200)
+        except lawpay.LawPayError as exc:
+            html = _oauth_html("LawPay connection failed", str(exc))
+            handler.send_response(exc.status)
+        handler.send_header("Content-Type", "text/html; charset=utf-8")
+        handler.send_header("Content-Length", str(len(html)))
+        handler.end_headers()
+        handler.wfile.write(html)
+        return
+
     provider = "gmail" if "google" in path else "microsoft" if "microsoft" in path else ""
     err = (query.get("error_description") or query.get("error") or [""])[0]
     state = (query.get("state") or [""])[0]
@@ -1088,6 +1164,8 @@ def main() -> None:
     FILES.mkdir(parents=True, exist_ok=True)
     db.connect()
     threading.Thread(target=_poll_loop, daemon=True, name="praecipe-sync").start()
+    if HOST not in {"127.0.0.1", "::1", "localhost"} and not os.environ.get("PRAECIPE_API_TOKEN", "").strip():
+        raise RuntimeError("PRAECIPE_API_TOKEN is required when Praecipe listens beyond this Mac.")
     server = ThreadingHTTPServer((HOST, PORT), Handler)
     print(f"Praecipe is running at http://{HOST}:{PORT}", flush=True)
     print(f"Matter files: {MATTER_FILES}", flush=True)

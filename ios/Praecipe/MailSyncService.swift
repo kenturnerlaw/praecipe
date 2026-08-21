@@ -28,14 +28,10 @@ final class MailSyncService: ObservableObject {
             status = "Add a mailbox in Settings."
             return
         }
-        let password = KeychainStore.password(account: account.email)
-        guard !password.isEmpty else {
-            status = "Mailbox password missing."
-            return
-        }
         busy = true
         status = "Getting mail…"
         do {
+            let credential = try await credential(for: account)
             let folders = ["INBOX", "Sent", "SENT", "[Gmail]/Sent Mail"]
             var added = 0
             for folder in Array(Set(folders)) {
@@ -43,7 +39,8 @@ final class MailSyncService: ObservableObject {
                     host: account.imapHost,
                     port: Int(account.imapPort) ?? 993,
                     user: account.imapUser,
-                    password: password,
+                    password: credential.password,
+                    oauthToken: credential.oauthToken,
                     folder: folder,
                     afterUID: folder.uppercased() == "INBOX" ? account.lastUID : 0
                 )
@@ -66,13 +63,14 @@ final class MailSyncService: ObservableObject {
 
     func toggleFlag(_ message: MailMessage, flag: String, add: Bool, context: ModelContext) async {
         guard let account = account(for: message, context: context) else { return }
-        let password = KeychainStore.password(account: account.email)
         do {
+            let credential = try await credential(for: account)
             try await transport.setFlag(
                 host: account.imapHost,
                 port: Int(account.imapPort) ?? 993,
                 user: account.imapUser,
-                password: password,
+                password: credential.password,
+                oauthToken: credential.oauthToken,
                 folder: message.folder,
                 uid: message.imapUID,
                 flag: "\\" + flag,
@@ -87,7 +85,7 @@ final class MailSyncService: ObservableObject {
     }
 
     func send(from account: MailAccount, to: [String], cc: [String] = [], subject: String, body: String, inReplyTo: String = "", references: String = "") async throws {
-        let password = KeychainStore.password(account: account.email)
+        let credential = try await credential(for: account)
         let fromHeader = account.displayName.isEmpty ? account.email : "\(account.displayName) <\(account.email)>"
         let raw = RFC822.buildRaw(from: fromHeader, to: to, cc: cc, subject: subject, body: body, inReplyTo: inReplyTo, references: references)
         try await transport.sendMail(
@@ -95,11 +93,21 @@ final class MailSyncService: ObservableObject {
             port: Int(account.smtpPort) ?? 587,
             tls: account.smtpTLS,
             user: account.smtpUser.isEmpty ? account.email : account.smtpUser,
-            password: password,
+            password: credential.password,
+            oauthToken: credential.oauthToken,
             from: account.email,
             to: to + cc,
             raw: raw
         )
+    }
+
+    private func credential(for account: MailAccount) async throws -> (password: String, oauthToken: String?) {
+        if account.provider == "microsoft" || account.authType == "oauth" {
+            return ("", try await MicrosoftOAuth.accessToken(email: account.email))
+        }
+        let password = KeychainStore.password(account: account.email)
+        guard !password.isEmpty else { throw MailError.auth("Mailbox password missing. Open Settings to repair sign in.") }
+        return (password, nil)
     }
 
     private func account(for message: MailMessage, context: ModelContext) -> MailAccount? {

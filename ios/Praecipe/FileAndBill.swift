@@ -83,7 +83,12 @@ enum FileAndBill {
                 result.error = "Put the client’s email on the matter."
             }
         }
-        try? context.save()
+        do {
+            try context.save()
+        } catch {
+            let saveError = "Praecipe completed the requested actions but could not save the practice record: \(error.localizedDescription)"
+            result.error = result.error.map { "\($0) \(saveError)" } ?? saveError
+        }
         return result
     }
 
@@ -99,9 +104,10 @@ enum FileAndBill {
             .appendingPathComponent(safeMatter, isDirectory: true)
             .appendingPathComponent(docType.rawValue, isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: dir.path)
         let dest = dir.appendingPathComponent(filename)
         do {
-            try data.write(to: dest, options: .atomic)
+            try data.write(to: dest, options: [.atomic, .completeFileProtection])
             let rel = "matters/\(safeMatter)/\(docType.rawValue)/\(filename)"
             let rec = MatterFile(filename: filename, relativePath: rel, docType: docType.rawValue, source: source)
             rec.matter = matter
