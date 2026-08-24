@@ -158,7 +158,7 @@ final class MailSyncService: ObservableObject {
         for att in parsed.attachments {
             let a = MailAttachment(filename: att.filename, mime: att.mime, data: att.data)
             a.message = msg
-            msg.attachments.append(a)
+            msg.attachments?.append(a)
         }
         context.insert(msg)
         ingestContacts(from: msg, context: context)

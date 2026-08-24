@@ -1,6 +1,9 @@
 import SwiftData
 import SwiftUI
 import UniformTypeIdentifiers
+#if PRAECIPE_ICLOUD
+import CloudKit
+#endif
 
 struct SettingsView: View {
     @Environment(\.modelContext) private var context
@@ -25,6 +28,7 @@ struct SettingsView: View {
     @State private var confirmRestore = false
     @State private var dataMessage = ""
     @State private var showDataMessage = false
+    @State private var iCloudStatus = "Checking Apple account…"
 
     var body: some View {
         Form {
@@ -117,9 +121,11 @@ struct SettingsView: View {
             }
             Section("Billing & data protection") {
                 #if PRAECIPE_ICLOUD
-                LabeledContent("iCloud sync", value: "Enabled")
+                LabeledContent("iCloud account", value: iCloudStatus)
+                Text("Praecipe automatically syncs its database records through the private iCloud account on this device. Files copied into the matter file vault remain protected in this device's app storage and are included in practice backups; automatic file-vault upload is a separate feature.")
+                    .font(.caption).foregroundStyle(.secondary)
                 #else
-                LabeledContent("iCloud sync", value: "Unavailable on Personal Team")
+                LabeledContent("iCloud account", value: "Not included in this build")
                 #endif
                 NavigationLink { LawPaySettingsView() } label: {
                     Label("LawPay", systemImage: "creditcard")
@@ -152,6 +158,9 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+        #if PRAECIPE_ICLOUD
+        .task { await refreshICloudStatus() }
+        #endif
         .onChange(of: provider.id) { _, _ in
             email = ""
             password = ""
@@ -203,6 +212,30 @@ struct SettingsView: View {
             Button("OK", role: .cancel) {}
         } message: { Text(dataMessage) }
     }
+
+    #if PRAECIPE_ICLOUD
+    @MainActor
+    private func refreshICloudStatus() async {
+        do {
+            switch try await CKContainer(identifier: "iCloud.com.kenturnerlaw.praecipe").accountStatus() {
+            case .available:
+                iCloudStatus = "Signed in — records sync automatically"
+            case .noAccount:
+                iCloudStatus = "Sign in to iCloud in Apple Settings"
+            case .restricted:
+                iCloudStatus = "Restricted on this device"
+            case .couldNotDetermine:
+                iCloudStatus = "Could not verify — try again"
+            case .temporarilyUnavailable:
+                iCloudStatus = "Temporarily unavailable"
+            @unknown default:
+                iCloudStatus = "Unavailable"
+            }
+        } catch {
+            iCloudStatus = "Verification failed — try again"
+        }
+    }
+    #endif
 
     private func accountIsConnected(_ account: MailAccount) -> Bool {
         account.provider == "microsoft" ? MicrosoftOAuth.hasSession(email: account.email) : KeychainStore.hasPassword(account: account.email)

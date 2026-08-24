@@ -34,7 +34,7 @@ enum FileAndBill {
             result.connected = true
         }
         if saveAttachments {
-            for att in message.attachments {
+            for att in message.attachments ?? [] {
                 if let saved = save(data: att.data, filename: att.filename, matter: matter, docType: docType, source: "mail", message: message, context: context) {
                     result.saved.append(saved)
                     att.savedRelativePath = saved

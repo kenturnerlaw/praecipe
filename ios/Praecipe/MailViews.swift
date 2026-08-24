@@ -123,8 +123,8 @@ struct MessageDetailView: View {
                 } else {
                     Text(message.bodyText.isEmpty ? stripHTML(message.bodyHTML) : message.bodyText)
                 }
-                if !message.attachments.isEmpty {
-                    ForEach(message.attachments) { att in
+                if let attachments = message.attachments, !attachments.isEmpty {
+                    ForEach(attachments) { att in
                         Label(att.filename, systemImage: "paperclip")
                             .font(.footnote)
                     }

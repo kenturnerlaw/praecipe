@@ -16,7 +16,7 @@ enum MatterMatcher {
     ]
 
     static func guessDocType(for message: MailMessage) -> DocType {
-        let names = message.attachments.map(\.filename).joined(separator: " ")
+        let names = (message.attachments ?? []).map(\.filename).joined(separator: " ")
         let text = normalize(blob(message) + " " + names)
         let rules: [(DocType, [String])] = [
             (.service, ["summons", "return of service", "proof of service", "served", "process server"]),
@@ -29,7 +29,7 @@ enum MatterMatcher {
         for (kind, needles) in rules where needles.contains(where: { text.contains($0) }) {
             return kind
         }
-        return message.attachments.isEmpty ? .correspondence : .pleading
+        return (message.attachments ?? []).isEmpty ? .correspondence : .pleading
     }
 
     static func match(message: MailMessage, matters: [Matter], priorFromSender: [PersistentIdentifier: Int], contactMatter: [String: PersistentIdentifier]) -> [MatterMatch] {

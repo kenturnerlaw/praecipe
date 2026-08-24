@@ -3,22 +3,22 @@ import SwiftData
 
 @Model
 final class MailAccount {
-    var provider: String
-    var email: String
-    var displayName: String
-    var accountDescription: String
-    var imapHost: String
-    var imapPort: String
-    var imapUser: String
-    var smtpHost: String
-    var smtpPort: String
-    var smtpUser: String
-    var smtpTLS: String
-    var authType: String
-    var isDefault: Bool
-    var enabled: Bool
-    var createdAt: Date
-    var lastUID: Int
+    var provider: String = ""
+    var email: String = ""
+    var displayName: String = ""
+    var accountDescription: String = "Praecipe"
+    var imapHost: String = ""
+    var imapPort: String = "993"
+    var imapUser: String = ""
+    var smtpHost: String = ""
+    var smtpPort: String = "587"
+    var smtpUser: String = ""
+    var smtpTLS: String = "starttls"
+    var authType: String = "password"
+    var isDefault: Bool = true
+    var enabled: Bool = true
+    var createdAt: Date = Date()
+    var lastUID: Int = 0
 
     init(provider: String, email: String, displayName: String = "") {
         self.provider = provider
@@ -42,22 +42,28 @@ final class MailAccount {
 
 @Model
 final class Matter {
-    var caseNo: String
-    var petitioner: String
-    var respondent: String
-    var style: String
-    var court: String
-    var county: String
-    var division: String
-    var status: String
-    var opposingCounsel: String
-    var clientEmail: String
-    var clientName: String
-    var rate: Double
-    var notes: String
-    var createdAt: Date
+    var caseNo: String = ""
+    var petitioner: String = ""
+    var respondent: String = ""
+    var style: String = ""
+    var court: String = "Circuit Court"
+    var county: String = ""
+    var division: String = "Family"
+    var status: String = "open"
+    var opposingCounsel: String = ""
+    var clientEmail: String = ""
+    var clientName: String = ""
+    var rate: Double = 0
+    var notes: String = ""
+    var createdAt: Date = Date()
     var billingExternalID: String?
     var lawPayContactID: String?
+    @Relationship(inverse: \MailMessage.matter) var messages: [MailMessage]?
+    @Relationship(inverse: \TimeEntry.matter) var timeEntries: [TimeEntry]?
+    @Relationship(inverse: \PracticeNote.matter) var practiceNotes: [PracticeNote]?
+    @Relationship(inverse: \CalendarEvent.matter) var calendarEvents: [CalendarEvent]?
+    @Relationship(inverse: \MatterFile.matter) var files: [MatterFile]?
+    @Relationship(inverse: \Person.matter) var people: [Person]?
 
     init(caseNo: String = "", style: String = "", status: String = "open") {
         self.caseNo = caseNo
@@ -86,32 +92,34 @@ final class Matter {
 
 @Model
 final class MailMessage {
-    var accountEmail: String
-    var imapUID: String
-    var folder: String
-    var messageIdHeader: String
-    var inReplyTo: String
-    var referencesHeader: String
-    var fromAddr: String
-    var toAddr: String
-    var ccAddr: String
-    var bccAddr: String
-    var replyTo: String
-    var subject: String
+    var accountEmail: String = ""
+    var imapUID: String = ""
+    var folder: String = "INBOX"
+    var messageIdHeader: String = ""
+    var inReplyTo: String = ""
+    var referencesHeader: String = ""
+    var fromAddr: String = ""
+    var toAddr: String = ""
+    var ccAddr: String = ""
+    var bccAddr: String = ""
+    var replyTo: String = ""
+    var subject: String = ""
     var sentAt: Date?
-    var snippet: String
-    var bodyText: String
-    var bodyHTML: String
-    var seen: Bool
-    var flagged: Bool
-    var deleted: Bool
-    var answered: Bool
-    var hasAttachments: Bool
-    var labelsJSON: String
-    var syncedAt: Date
+    var snippet: String = ""
+    var bodyText: String = ""
+    var bodyHTML: String = ""
+    var seen: Bool = false
+    var flagged: Bool = false
+    var deleted: Bool = false
+    var answered: Bool = false
+    var hasAttachments: Bool = false
+    var labelsJSON: String = "[]"
+    var syncedAt: Date = Date()
     var matter: Matter?
-
-    @Relationship(deleteRule: .cascade) var attachments: [MailAttachment]
+    @Relationship(deleteRule: .cascade, inverse: \MailAttachment.message) var attachments: [MailAttachment]?
+    @Relationship(inverse: \TimeEntry.message) var timeEntries: [TimeEntry]?
+    @Relationship(inverse: \CalendarEvent.message) var calendarEvents: [CalendarEvent]?
+    @Relationship(inverse: \MatterFile.message) var files: [MatterFile]?
 
     init(accountEmail: String, folder: String, imapUID: String) {
         self.accountEmail = accountEmail
@@ -143,11 +151,11 @@ final class MailMessage {
 
 @Model
 final class MailAttachment {
-    var filename: String
-    var mime: String
-    var size: Int
-    var data: Data?
-    var savedRelativePath: String
+    var filename: String = ""
+    var mime: String = "application/octet-stream"
+    var size: Int = 0
+    @Attribute(.externalStorage) var data: Data?
+    var savedRelativePath: String = ""
     var message: MailMessage?
 
     init(filename: String, mime: String, data: Data?) {
@@ -165,13 +173,13 @@ final class TimeEntry {
     var message: MailMessage?
     var startedAt: Date?
     var endedAt: Date?
-    var minutes: Double
-    var activity: String
-    var entryDescription: String
-    var billed: Bool
-    var rate: Double
-    var running: Bool
-    var createdAt: Date
+    var minutes: Double = 0
+    var activity: String = "email"
+    var entryDescription: String = ""
+    var billed: Bool = false
+    var rate: Double = 0
+    var running: Bool = false
+    var createdAt: Date = Date()
     var billingExternalID: String?
     var lawPayInvoiceSourceID: String?
     var lawPayInvoiceID: String?
@@ -203,10 +211,10 @@ final class TimeEntry {
 @Model
 final class PracticeNote {
     var matter: Matter?
-    var title: String
-    var body: String
-    var createdAt: Date
-    var updatedAt: Date
+    var title: String = ""
+    var body: String = ""
+    var createdAt: Date = Date()
+    var updatedAt: Date = Date()
 
     init(title: String, body: String) {
         self.title = title
@@ -220,18 +228,18 @@ final class PracticeNote {
 final class CalendarEvent {
     var matter: Matter?
     var message: MailMessage?
-    var title: String
-    var eventType: String
-    var startAt: Date
+    var title: String = ""
+    var eventType: String = "appointment"
+    var startAt: Date = Date()
     var endAt: Date?
-    var allDay: Bool
-    var location: String
-    var ruleCite: String
-    var source: String
-    var notes: String
-    var remindMinutes: Int
-    var dismissed: Bool
-    var createdAt: Date
+    var allDay: Bool = true
+    var location: String = ""
+    var ruleCite: String = ""
+    var source: String = "manual"
+    var notes: String = ""
+    var remindMinutes: Int = 30
+    var dismissed: Bool = false
+    var createdAt: Date = Date()
 
     init(title: String, startAt: Date, eventType: String = "appointment", allDay: Bool = true) {
         self.title = title
@@ -253,12 +261,12 @@ final class CalendarEvent {
 final class MatterFile {
     var matter: Matter?
     var message: MailMessage?
-    var filename: String
-    var relativePath: String
-    var source: String
-    var sourceURL: String
-    var docType: String
-    var createdAt: Date
+    var filename: String = ""
+    var relativePath: String = ""
+    var source: String = ""
+    var sourceURL: String = ""
+    var docType: String = "other"
+    var createdAt: Date = Date()
 
     init(filename: String, relativePath: String, docType: String, source: String) {
         self.filename = filename
@@ -272,13 +280,13 @@ final class MatterFile {
 
 @Model
 final class Person {
-    var name: String
-    var email: String
-    var phone: String
-    var firm: String
-    var notes: String
+    var name: String = ""
+    var email: String = ""
+    var phone: String = ""
+    var firm: String = ""
+    var notes: String = ""
     var matter: Matter?
-    var createdAt: Date
+    var createdAt: Date = Date()
 
     init(email: String, name: String = "") {
         self.email = email.lowercased()
@@ -292,10 +300,10 @@ final class Person {
 
 @Model
 final class MailSignature {
-    var name: String
-    var body: String
-    var isDefault: Bool
-    var createdAt: Date
+    var name: String = ""
+    var body: String = ""
+    var isDefault: Bool = false
+    var createdAt: Date = Date()
 
     init(name: String, body: String, isDefault: Bool) {
         self.name = name
@@ -307,8 +315,8 @@ final class MailSignature {
 
 @Model
 final class AppSetting {
-    var key: String
-    var value: String
+    var key: String = ""
+    var value: String = ""
 
     init(key: String, value: String) {
         self.key = key
