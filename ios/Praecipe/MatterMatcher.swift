@@ -10,6 +10,10 @@ struct MatterMatch: Identifiable {
 }
 
 enum MatterMatcher {
+    /// Matches the confidence bands used by the Outlook/web File & Bill UI.
+    static let suggestionThreshold = 45
+    static let highConfidenceThreshold = 75
+
     static let stop: Set<String> = [
         "the", "and", "for", "vs", "v", "aka", "nka", "fka", "estate", "minor", "child",
         "unknown", "intake", "unassigned", "mail", "petitioner", "respondent",
@@ -35,8 +39,8 @@ enum MatterMatcher {
     static func match(message: MailMessage, matters: [Matter], priorFromSender: [PersistentIdentifier: Int], contactMatter: [String: PersistentIdentifier]) -> [MatterMatch] {
         let blobText = blob(message)
         let norm = normalize(blobText)
-        let addrs = Set(emailAddresses(in: blobText))
-        let from = emailAddresses(in: message.fromAddr).first ?? ""
+        let addrs = Set(emailAddresses(in: [message.fromAddr, message.toAddr, message.ccAddr].joined(separator: " ")))
+        let caseHits = caseNumberHits(in: blobText)
         var scored: [MatterMatch] = []
         for m in matters where m.status != "closed" {
             var reasons: [String] = []
@@ -47,6 +51,11 @@ enum MatterMatcher {
                 let rawCompact = blobText.uppercased().replacingOccurrences(of: "[\\s-]", with: "", options: .regularExpression)
                 if !compact.isEmpty && rawCompact.contains(compact) {
                     score += 55
+                    reasons.append("case number \(caseNo)")
+                } else if caseHits.contains(where: { hit in
+                    hit.count >= 5 && (hit.contains(compact) || compact.contains(hit))
+                }) {
+                    score += 50
                     reasons.append("case number \(caseNo)")
                 }
             }
@@ -70,9 +79,9 @@ enum MatterMatcher {
                 score += min(30, 12 + n * 3)
                 reasons.append("prior mail from this sender (\(n))")
             }
-            if !from.isEmpty, contactMatter[from] == m.persistentModelID {
+            if let contact = addrs.first(where: { contactMatter[$0] == m.persistentModelID }) {
                 score += 25
-                reasons.append("contact \(from)")
+                reasons.append("contact \(contact)")
             }
             let client = m.clientEmail.lowercased()
             if !client.isEmpty && addrs.contains(client) {
@@ -92,7 +101,15 @@ enum MatterMatcher {
                 scored.append(MatterMatch(matter: m, confidence: score, reasons: reasons))
             }
         }
-        return scored.sorted { $0.confidence > $1.confidence }.prefix(5).map { $0 }
+        return scored.sorted {
+            if $0.confidence != $1.confidence { return $0.confidence > $1.confidence }
+            return $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending
+        }.prefix(5).map { $0 }
+    }
+
+    static func suggestedMatch(from matches: [MatterMatch]) -> MatterMatch? {
+        guard let first = matches.first, first.confidence >= suggestionThreshold else { return nil }
+        return first
     }
 
     static func priorCounts(messages: [MailMessage], from: String) -> [PersistentIdentifier: Int] {
@@ -126,6 +143,16 @@ enum MatterMatcher {
 
     private static func word(_ w: String, in blob: String) -> Bool {
         blob.split(separator: " ").contains(where: { $0 == w })
+    }
+
+    private static func caseNumberHits(in text: String) -> [String] {
+        let pattern = #"\b(\d{2,4}[- ]?DR[- ]?\d{1,6}|\d{2}DR\d{3,6}|\d{4}[A-Z]{2,4}\d{3,8})\b"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return [] }
+        let ns = text as NSString
+        return regex.matches(in: text, range: NSRange(location: 0, length: ns.length)).compactMap { match in
+            guard match.numberOfRanges > 1 else { return nil }
+            return ns.substring(with: match.range(at: 1)).uppercased().replacingOccurrences(of: " ", with: "")
+        }
     }
 }
 

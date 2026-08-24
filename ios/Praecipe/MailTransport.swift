@@ -18,6 +18,19 @@ struct IMAPEnvelope {
     var rfc822: Data
 }
 
+enum MailDeleteResult {
+    case movedToTrash
+
+    var confirmation: String {
+        "Moved to Trash."
+    }
+}
+
+private struct IMAPMailboxList {
+    var names: [String]
+    var specialTrash: String?
+}
+
 /// IMAP (993 TLS) and SMTP (465 SSL or 587 STARTTLS) for app-password accounts.
 actor MailTransport {
     func testIMAP(host: String, port: Int, user: String, password: String, oauthToken: String? = nil) async throws {
@@ -36,8 +49,9 @@ actor MailTransport {
         defer { conn.close() }
         _ = try conn.readLine()
         try imapLogin(conn, user: user, password: password, oauthToken: oauthToken)
-        let boxes = try imapList(conn)
-        let selectName = boxes.first(where: { $0.caseInsensitiveCompare(folder) == .orderedSame }) ?? folder
+        let listing = try imapList(conn)
+        let boxes = listing.names
+        let selectName = resolveMailbox(folder, in: boxes) ?? folder
         guard try imapOK(conn, "SELECT \(imapQuote(selectName))") else {
             _ = try? conn.command("LOGOUT")
             return (false, [], boxes)
@@ -52,14 +66,67 @@ actor MailTransport {
     }
 
     func setFlag(host: String, port: Int, user: String, password: String, oauthToken: String? = nil, folder: String, uid: String, flag: String, add: Bool) async throws {
+        guard uid.allSatisfy(\.isNumber), !uid.isEmpty else {
+            throw MailError.protocolFailure("This message has an invalid mailbox identifier.")
+        }
         let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
         defer { conn.close() }
         _ = try conn.readLine()
         try imapLogin(conn, user: user, password: password, oauthToken: oauthToken)
-        _ = try imapOK(conn, "SELECT \(imapQuote(folder))")
+        let boxes = try imapList(conn).names
+        let selected = resolveMailbox(folder, in: boxes) ?? folder
+        guard try imapOK(conn, "SELECT \(imapQuote(selected))") else {
+            throw MailError.protocolFailure("The mailbox folder could not be opened.")
+        }
         let op = add ? "+FLAGS.SILENT" : "-FLAGS.SILENT"
-        _ = try conn.command("UID STORE \(uid) \(op) (\(flag))")
+        guard isOK(try conn.command("UID STORE \(uid) \(op) (\(flag))")) else {
+            throw MailError.protocolFailure("The mail server did not update the message.")
+        }
         _ = try? conn.command("LOGOUT")
+    }
+
+    func deleteMessage(host: String, port: Int, user: String, password: String, oauthToken: String? = nil, folder: String, uid: String) async throws -> MailDeleteResult {
+        guard uid.allSatisfy(\.isNumber), !uid.isEmpty else {
+            throw MailError.protocolFailure("This message has an invalid mailbox identifier.")
+        }
+        let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
+        defer { conn.close() }
+        _ = try conn.readLine()
+        try imapLogin(conn, user: user, password: password, oauthToken: oauthToken)
+
+        let capability = (try? conn.command("CAPABILITY"))?.uppercased() ?? ""
+        let listing = try imapList(conn)
+        let boxes = listing.names
+        let selected = resolveMailbox(folder, in: boxes) ?? folder
+        guard try imapOK(conn, "SELECT \(imapQuote(selected))") else {
+            throw MailError.protocolFailure("The mailbox folder could not be opened.")
+        }
+        let supportsUIDExpunge = capability.contains("UIDPLUS")
+        let alreadyDeleted = supportsUIDExpunge ? [] : (try? imapDeletedUIDs(conn)) ?? []
+        let safeToExpungeFolder = supportsUIDExpunge || alreadyDeleted.allSatisfy { String($0) == uid }
+
+        guard let trash = listing.specialTrash ?? trashMailbox(in: boxes), trash.caseInsensitiveCompare(selected) != .orderedSame else {
+            throw MailError.protocolFailure("The mail server did not provide a Trash folder, so the message was not deleted.")
+        }
+        if isOK(try conn.command("UID MOVE \(uid) \(imapQuote(trash))")) {
+            _ = try? conn.command("LOGOUT")
+            return .movedToTrash
+        }
+
+        // RFC 6851 MOVE is not universal. COPY + \Deleted provides the same
+        // recoverable result, but only when this message can be expunged alone.
+        if safeToExpungeFolder, isOK(try conn.command("UID COPY \(uid) \(imapQuote(trash))")) {
+            guard isOK(try conn.command("UID STORE \(uid) +FLAGS.SILENT (\\Deleted)")) else {
+                throw MailError.protocolFailure("The message was copied to Trash, but the original could not be removed.")
+            }
+            let expunge = supportsUIDExpunge ? "UID EXPUNGE \(uid)" : "EXPUNGE"
+            guard isOK(try conn.command(expunge)) else {
+                throw MailError.protocolFailure("The original message could not be removed after it was copied to Trash.")
+            }
+            _ = try? conn.command("LOGOUT")
+            return .movedToTrash
+        }
+        throw MailError.protocolFailure("The mail server could not safely move this message to Trash.")
     }
 
     func sendMail(host: String, port: Int, tls: String, user: String, password: String, oauthToken: String? = nil, from: String, to: [String], raw: String) async throws {
@@ -117,18 +184,57 @@ actor MailTransport {
         }
     }
 
-    private func imapList(_ conn: MailStream) throws -> [String] {
+    private func imapList(_ conn: MailStream) throws -> IMAPMailboxList {
         let r = try conn.command("LIST \"\" \"*\"")
         var names: [String] = []
+        var specialTrash: String?
         for line in r.components(separatedBy: "\n") where line.hasPrefix("* LIST") {
-            if let name = parseListName(line) { names.append(name) }
+            if let name = parseListName(line) {
+                names.append(name)
+                if line.uppercased().contains("\\TRASH") { specialTrash = name }
+            }
         }
-        return names
+        return IMAPMailboxList(names: names, specialTrash: specialTrash)
     }
 
     private func imapOK(_ conn: MailStream, _ cmd: String) throws -> Bool {
         let r = try conn.command(cmd)
-        return r.contains(" OK ")
+        return isOK(r)
+    }
+
+    private func isOK(_ response: String) -> Bool {
+        response.components(separatedBy: "\n")
+            .last(where: { !$0.isEmpty })?
+            .uppercased()
+            .contains(" OK ") == true
+    }
+
+    private func resolveMailbox(_ requested: String, in boxes: [String]) -> String? {
+        if let exact = boxes.first(where: { $0.caseInsensitiveCompare(requested) == .orderedSame }) {
+            return exact
+        }
+        let role = requested.lowercased()
+        if role == "sent" {
+            return boxes.first(where: { $0.lowercased().contains("sent") })
+        }
+        if role == "trash" || role.contains("deleted") {
+            return trashMailbox(in: boxes)
+        }
+        return nil
+    }
+
+    private func trashMailbox(in boxes: [String]) -> String? {
+        let preferred = ["deleted items", "trash", "deleted messages", "bin"]
+        for name in preferred {
+            if let exact = boxes.first(where: {
+                let leaf = $0.lowercased().split(separator: "/").last.map(String.init) ?? $0.lowercased()
+                return leaf == name
+            }) { return exact }
+        }
+        return boxes.first(where: {
+            let value = $0.lowercased()
+            return value.contains("trash") || value.contains("deleted items") || value.contains("deleted messages")
+        })
     }
 
     private func imapSearch(_ conn: MailStream, afterUID: Int) throws -> [Int] {
@@ -141,6 +247,17 @@ actor MailTransport {
             }
         }
         return uids.sorted()
+    }
+
+    private func imapDeletedUIDs(_ conn: MailStream) throws -> [Int] {
+        let response = try conn.command("UID SEARCH DELETED")
+        var uids: [Int] = []
+        for line in response.components(separatedBy: "\n") where line.hasPrefix("* SEARCH") {
+            for part in line.split(separator: " ").dropFirst(2) {
+                if let uid = Int(part) { uids.append(uid) }
+            }
+        }
+        return uids
     }
 
     private func imapFetch(_ conn: MailStream, uid: Int) throws -> IMAPEnvelope? {

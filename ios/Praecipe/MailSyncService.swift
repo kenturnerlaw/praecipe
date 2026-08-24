@@ -84,6 +84,59 @@ final class MailSyncService: ObservableObject {
         }
     }
 
+    @discardableResult
+    func delete(_ message: MailMessage, context: ModelContext) async -> Bool {
+        guard !busy else {
+            status = "Please wait for the current mailbox action to finish."
+            return false
+        }
+        guard let account = account(for: message, context: context) else {
+            status = "The mailbox for this message is not configured."
+            return false
+        }
+        busy = true
+        status = "Moving message to Trash…"
+        defer { busy = false }
+        let result: MailDeleteResult
+        do {
+            let credential = try await credential(for: account)
+            result = try await transport.deleteMessage(
+                host: account.imapHost,
+                port: Int(account.imapPort) ?? 993,
+                user: account.imapUser,
+                password: credential.password,
+                oauthToken: credential.oauthToken,
+                folder: message.folder,
+                uid: message.imapUID
+            )
+        } catch {
+            status = "Delete failed: \(error.localizedDescription)"
+            return false
+        }
+
+        message.deleted = true
+        do {
+            try context.save()
+            status = result.confirmation
+            return true
+        } catch {
+            // The server move has already completed. Keep the in-memory row
+            // hidden and report the local persistence issue accurately.
+            status = "Moved to Trash, but the local mail list could not be saved: \(error.localizedDescription)"
+            return true
+        }
+    }
+
+    func assignMatter(_ matter: Matter, to message: MailMessage, context: ModelContext) {
+        message.matter = matter
+        do {
+            try context.save()
+            status = "Filed under \(matter.label)."
+        } catch {
+            status = "The matter assignment could not be saved: \(error.localizedDescription)"
+        }
+    }
+
     func send(from account: MailAccount, to: [String], cc: [String] = [], subject: String, body: String, inReplyTo: String = "", references: String = "") async throws {
         let credential = try await credential(for: account)
         let fromHeader = account.displayName.isEmpty ? account.email : "\(account.displayName) <\(account.email)>"
@@ -136,6 +189,7 @@ final class MailSyncService: ObservableObject {
         if let existing = try? context.fetch(descriptor).first {
             existing.seen = env.flags.contains { $0.caseInsensitiveCompare("Seen") == .orderedSame }
             existing.flagged = env.flags.contains { $0.caseInsensitiveCompare("Flagged") == .orderedSame }
+            existing.deleted = env.flags.contains { $0.caseInsensitiveCompare("Deleted") == .orderedSame }
             return 0
         }
         let msg = MailMessage(accountEmail: account.email, folder: folder, imapUID: env.uid)
@@ -154,6 +208,7 @@ final class MailSyncService: ObservableObject {
         msg.snippet = String((parsed.text.isEmpty ? stripHTML(parsed.html) : parsed.text).prefix(240))
         msg.seen = env.flags.contains { $0.caseInsensitiveCompare("Seen") == .orderedSame }
         msg.flagged = env.flags.contains { $0.caseInsensitiveCompare("Flagged") == .orderedSame }
+        msg.deleted = env.flags.contains { $0.caseInsensitiveCompare("Deleted") == .orderedSame }
         msg.hasAttachments = !parsed.attachments.isEmpty
         for att in parsed.attachments {
             let a = MailAttachment(filename: att.filename, mime: att.mime, data: att.data)
@@ -174,6 +229,7 @@ final class MailSyncService: ObservableObject {
             context.insert(Person(email: addr, name: displayName(in: blob, email: addr)))
         }
     }
+
 }
 
 func stripHTML(_ html: String) -> String {

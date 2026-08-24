@@ -7,8 +7,11 @@ struct MailHomeView: View {
     @EnvironmentObject private var mail: MailSyncService
     @Query(sort: \MailMessage.sentAt, order: .reverse) private var messages: [MailMessage]
     @Query private var accounts: [MailAccount]
+    @Query private var matters: [Matter]
+    @Query private var people: [Person]
     @State private var folder = "INBOX"
     @State private var compose = false
+    @State private var pendingDelete: MailMessage?
 
     var body: some View {
         NavigationStack {
@@ -22,6 +25,7 @@ struct MailHomeView: View {
                 .listRowBackground(Color.clear)
 
                 ForEach(filtered) { msg in
+                    let suggestion = MatterMatcher.suggestedMatch(from: matches(for: msg))
                     NavigationLink {
                         MessageDetailView(message: msg)
                     } label: {
@@ -44,9 +48,66 @@ struct MailHomeView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .lineLimit(2)
+                            if let matter = msg.matter {
+                                Label("Filed: \(matter.label)", systemImage: "folder.fill")
+                                    .font(.caption2)
+                                    .foregroundStyle(.green)
+                                    .lineLimit(1)
+                            } else if let suggestion {
+                                Label("Suggested: \(suggestion.label) · \(suggestion.confidence)%", systemImage: "sparkles")
+                                    .font(.caption2)
+                                    .foregroundStyle(suggestion.confidence >= MatterMatcher.highConfidenceThreshold ? .green : .orange)
+                                    .lineLimit(1)
+                            }
                         }
                     }
                     .listRowBackground(msg.seen ? Color.clear : Color.blue.opacity(0.06))
+                    .swipeActions(edge: .trailing, allowsFullSwipe: false) {
+                        Button(role: .destructive) {
+                            pendingDelete = msg
+                        } label: {
+                            Label("Delete", systemImage: "trash")
+                        }
+                    }
+                    .swipeActions(edge: .leading, allowsFullSwipe: false) {
+                        Button {
+                            Task { await mail.toggleFlag(msg, flag: "Seen", add: !msg.seen, context: context) }
+                        } label: {
+                            Label(msg.seen ? "Unread" : "Read", systemImage: msg.seen ? "envelope.badge" : "envelope.open")
+                        }
+                        .tint(.blue)
+                        Button {
+                            Task { await mail.toggleFlag(msg, flag: "Flagged", add: !msg.flagged, context: context) }
+                        } label: {
+                            Label(msg.flagged ? "Unflag" : "Flag", systemImage: msg.flagged ? "flag.slash" : "flag")
+                        }
+                        .tint(.orange)
+                    }
+                    .contextMenu {
+                        Button {
+                            Task { await mail.toggleFlag(msg, flag: "Seen", add: !msg.seen, context: context) }
+                        } label: {
+                            Label(msg.seen ? "Mark Unread" : "Mark Read", systemImage: msg.seen ? "envelope.badge" : "envelope.open")
+                        }
+                        Button {
+                            Task { await mail.toggleFlag(msg, flag: "Flagged", add: !msg.flagged, context: context) }
+                        } label: {
+                            Label(msg.flagged ? "Remove Flag" : "Flag", systemImage: msg.flagged ? "flag.slash" : "flag")
+                        }
+                        if let suggestion {
+                            Button {
+                                mail.assignMatter(suggestion.matter, to: msg, context: context)
+                            } label: {
+                                Label("File under \(suggestion.label) (\(suggestion.confidence)%)", systemImage: "folder.badge.plus")
+                            }
+                        }
+                        Divider()
+                        Button(role: .destructive) {
+                            pendingDelete = msg
+                        } label: {
+                            Label("Move to Trash", systemImage: "trash")
+                        }
+                    }
                 }
             }
             .navigationTitle("Praecipe")
@@ -75,7 +136,41 @@ struct MailHomeView: View {
             .sheet(isPresented: $compose) {
                 ComposeView(prefill: .new)
             }
+            .alert("Move email to Trash?", isPresented: deleteAlertPresented, presenting: pendingDelete) { message in
+                Button("Cancel", role: .cancel) {}
+                Button("Move to Trash", role: .destructive) {
+                    Task { await mail.delete(message, context: context) }
+                }
+            } message: { message in
+                Text(message.subject.isEmpty ? "This email will be moved to the mailbox Trash folder." : "“\(message.subject)” will be moved to the mailbox Trash folder.")
+            }
         }
+    }
+
+    private var deleteAlertPresented: Binding<Bool> {
+        Binding(
+            get: { pendingDelete != nil },
+            set: { if !$0 { pendingDelete = nil } }
+        )
+    }
+
+    private var contactMatter: [String: PersistentIdentifier] {
+        var result: [String: PersistentIdentifier] = [:]
+        for person in people {
+            guard let matter = person.matter, !person.email.isEmpty else { continue }
+            result[person.email.lowercased()] = matter.persistentModelID
+        }
+        return result
+    }
+
+    private func matches(for message: MailMessage) -> [MatterMatch] {
+        let from = emailAddresses(in: message.fromAddr).first ?? ""
+        return MatterMatcher.match(
+            message: message,
+            matters: matters,
+            priorFromSender: MatterMatcher.priorCounts(messages: messages, from: from),
+            contactMatter: contactMatter
+        )
     }
 
     private var filtered: [MailMessage] {
@@ -96,6 +191,7 @@ struct MessageDetailView: View {
     @EnvironmentObject private var mail: MailSyncService
     @Query private var matters: [Matter]
     @Query private var accounts: [MailAccount]
+    @Query private var people: [Person]
     @Query(sort: \MailMessage.sentAt, order: .reverse) private var allMail: [MailMessage]
     @State private var compose: ComposePrefill?
     @State private var billStatus = ""
@@ -148,12 +244,12 @@ struct MessageDetailView: View {
         .onAppear {
             let from = emailAddresses(in: message.fromAddr).first ?? ""
             let prior = MatterMatcher.priorCounts(messages: allMail, from: from)
-            let matches = MatterMatcher.match(message: message, matters: matters, priorFromSender: prior, contactMatter: [:])
+            let matches = MatterMatcher.match(message: message, matters: matters, priorFromSender: prior, contactMatter: contactMatter)
             if selectedMatter == nil {
-                selectedMatter = message.matter ?? matches.first(where: { $0.confidence >= 45 })?.matter ?? matches.first?.matter
+                selectedMatter = message.matter ?? MatterMatcher.suggestedMatch(from: matches)?.matter
             }
             docType = MatterMatcher.guessDocType(for: message)
-            clientEmail = selectedMatter?.clientEmail ?? matches.first?.matter.clientEmail ?? ""
+            clientEmail = selectedMatter?.clientEmail ?? MatterMatcher.suggestedMatch(from: matches)?.matter.clientEmail ?? ""
             downloadURLs = MailExtract.urls(in: message).contains(where: \.serviceLikely)
         }
     }
@@ -171,8 +267,17 @@ struct MessageDetailView: View {
             message: message,
             matters: matters,
             priorFromSender: MatterMatcher.priorCounts(messages: allMail, from: from),
-            contactMatter: [:]
+            contactMatter: contactMatter
         )
+    }
+
+    private var contactMatter: [String: PersistentIdentifier] {
+        var result: [String: PersistentIdentifier] = [:]
+        for person in people {
+            guard let matter = person.matter, !person.email.isEmpty else { continue }
+            result[person.email.lowercased()] = matter.persistentModelID
+        }
+        return result
     }
 
     private var fileBill: some View {
@@ -187,7 +292,7 @@ struct MessageDetailView: View {
             if let top = matches.first {
                 Text("\(top.confidence)% — \(top.reasons.joined(separator: "; "))")
                     .font(.caption)
-                    .foregroundStyle(top.confidence >= 75 ? .green : top.confidence >= 45 ? .orange : .secondary)
+                    .foregroundStyle(top.confidence >= MatterMatcher.highConfidenceThreshold ? .green : top.confidence >= MatterMatcher.suggestionThreshold ? .orange : .secondary)
             }
             Toggle("Connect this message to the matter", isOn: $connect)
             Toggle("Save attachments to the matter folder", isOn: $saveAtt)
