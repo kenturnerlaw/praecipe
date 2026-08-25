@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 
 TENANT = "eedeccaf-01c1-4439-a88b-88e587be9f1c"
+CLIENT = "1f0ced9a-277d-46b6-be8b-7728315eb595"
 REDIRECT = "https://login.microsoftonline.com/common/oauth2/nativeclient"
 SCOPE = "offline_access https://outlook.office.com/IMAP.AccessAsUser.All https://outlook.office.com/SMTP.Send"
 
@@ -37,7 +38,7 @@ if "scope=offline_access%20https%3A%2F%2Foutlook.office.com" not in form:
     fails.append(f"form {form}")
 
 # Tenant-specific authorize URL must load (firm client required at runtime; no generic Office client)
-firm = "11111111-2222-3333-4444-555555555555"
+firm = CLIENT
 auth = f"https://login.microsoftonline.com/{TENANT}/oauth2/v2.0/authorize?" + urllib.parse.urlencode({
     "client_id": firm,
     "response_type": "code",

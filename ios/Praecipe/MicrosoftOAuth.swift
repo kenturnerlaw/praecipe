@@ -5,8 +5,8 @@ import SwiftData
 enum MicrosoftOAuth {
     /// Kenneth’s work tenant.
     static let tenantID = "eedeccaf-01c1-4439-a88b-88e587be9f1c"
-    /// Baked public client. Kenneth’s own Praecipe app UUID was never stored in this repo; do not switch.
-    static let clientID = "d3590ed6-52b3-4102-aeff-aad2292ab01c"
+    /// Praecipe's registered public-client application in Kenneth's Entra tenant.
+    static let clientID = "1f0ced9a-277d-46b6-be8b-7728315eb595"
     static let tokenURL = URL(string: "https://login.microsoftonline.com/\(tenantID)/oauth2/v2.0/token")!
     static let deviceURL = URL(string: "https://login.microsoftonline.com/\(tenantID)/oauth2/v2.0/devicecode")!
     static let authorizeURL = URL(string: "https://login.microsoftonline.com/\(tenantID)/oauth2/v2.0/authorize")!
@@ -74,10 +74,17 @@ enum MicrosoftOAuth {
         let m = message
             .replacingOccurrences(of: "+", with: " ")
             .removingPercentEncoding ?? message
-        if isAdminConsentError(m) || m.lowercased().contains("aadsts") || m.lowercased().contains("unauthorized") || m.lowercased().contains("invalid_client") {
-            return "Couldn’t complete Microsoft sign-in. Tap Sign In to try again."
+        let lower = m.lowercased()
+        if lower.contains("aadsts50011") || lower.contains("redirect_uri") {
+            return "Microsoft rejected Praecipe's return address. The Entra app must include https://login.microsoftonline.com/common/oauth2/nativeclient as a Mobile and desktop redirect URI."
         }
-        if m.lowercased().contains("invalid_grant") {
+        if isAdminConsentError(m) {
+            return "Microsoft has not granted Praecipe permission to use Outlook mail. Grant the configured IMAP and SMTP permissions in Entra, then sign in again."
+        }
+        if lower.contains("aadsts700016") || lower.contains("invalid_client") {
+            return "Microsoft could not find Praecipe's Entra app registration (1f0ced9a-277d-46b6-be8b-7728315eb595) in this tenant."
+        }
+        if lower.contains("invalid_grant") {
             return "Microsoft sign-in expired. Sign in again."
         }
         if m.count > 180 { return "Couldn’t complete Microsoft sign-in. Tap Sign In to try again." }

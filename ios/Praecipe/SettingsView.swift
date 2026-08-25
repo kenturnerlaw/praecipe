@@ -2,7 +2,6 @@ import AuthenticationServices
 import SwiftData
 import SwiftUI
 import UIKit
-import WebKit
 
 struct SettingsView: View {
     @Environment(\.modelContext) private var context
@@ -82,11 +81,11 @@ struct AddAccountSheet: View {
     @State private var verifying = false
     @State private var error = ""
     @State private var browser: MicrosoftOAuth.BrowserStart?
-    @State private var consentRetries = 0
     @State private var authSession: MicrosoftAuthSessionController?
-    @State private var useEmbeddedLogin = false
+    @State private var connectedEmail = ""
+    @State private var showConnected = false
 
-    enum Step { case pick, credentials, microsoftPage }
+    enum Step { case pick, credentials }
 
     var body: some View {
         NavigationStack {
@@ -106,6 +105,11 @@ struct AddAccountSheet: View {
                     Button("Cancel") { dismiss() }
                         .disabled(verifying)
                 }
+            }
+            .alert("Microsoft mailbox connected", isPresented: $showConnected) {
+                Button("Done") { dismiss() }
+            } message: {
+                Text("Praecipe signed in and verified Inbox access for \(connectedEmail).")
             }
         }
         .interactiveDismissDisabled(working || verifying)
@@ -131,17 +135,7 @@ struct AddAccountSheet: View {
             .navigationBarTitleDisplayMode(.inline)
         } else if let provider {
             if provider.id == "microsoft" {
-                if step == .microsoftPage, let browser {
-                    MicrosoftLoginWebView(startURL: browser.url) { result in
-                        Task { await finishMicrosoft(result) }
-                    }
-                    .id(browser.url.absoluteString + "-\(browser.verifier.prefix(8))")
-                    .ignoresSafeArea(edges: .bottom)
-                    .navigationTitle("Microsoft Sign In")
-                    .navigationBarTitleDisplayMode(.inline)
-                } else {
-                    exchangeForm
-                }
+                exchangeForm
             } else {
                 passwordForm(provider)
             }
@@ -161,14 +155,21 @@ struct AddAccountSheet: View {
                     .praecipeCaption()
             }
             Section {
-                Button {
-                    startMicrosoftSignIn()
-                } label: {
-                    Text("Sign In")
-                        .frame(maxWidth: .infinity)
+                if working {
+                    HStack {
+                        ProgressView()
+                        Text("Waiting for Microsoft…")
+                    }
+                    .frame(maxWidth: .infinity)
+                } else {
+                    Button {
+                        startMicrosoftSignIn()
+                    } label: {
+                        Text("Sign In")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(email.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || verifying)
             }
         }
         .scrollContentBackground(.hidden)
@@ -236,13 +237,21 @@ struct AddAccountSheet: View {
             return
         }
         do {
-            // Always push an in-app Microsoft page from this sheet.
-            // ASWebAuthenticationSession often "starts" with no UI when launched from a nested sheet
-            // (Sign In looks dead). WebView + msauth handoff is the reliable path here.
+            // A system authentication session owns the complete browser → Authenticator
+            // → Praecipe round trip. An embedded web view loses that handoff.
+            MicrosoftOAuth.clearTokens(email: hint.lowercased())
             let start = try MicrosoftOAuth.startBrowser(loginHint: hint, prompt: prompt)
             browser = start
-            useEmbeddedLogin = true
-            step = .microsoftPage
+            let controller = MicrosoftAuthSessionController()
+            authSession = controller
+            working = true
+            guard controller.start(url: start.url, completion: { result in
+                Task { @MainActor in await finishMicrosoft(result) }
+            }) else {
+                authSession = nil
+                working = false
+                throw MailError.auth("Microsoft sign-in could not be presented. Close the account sheet, reopen it, and try again.")
+            }
         } catch {
             self.error = error.localizedDescription
             step = .credentials
@@ -250,6 +259,7 @@ struct AddAccountSheet: View {
     }
 
     private func finishMicrosoft(_ result: Result<String, Error>) async {
+        authSession = nil
         switch result {
         case .failure(let err):
             let ns = err as NSError
@@ -260,7 +270,6 @@ struct AddAccountSheet: View {
                 working = false
                 error = ""
                 step = .credentials
-                useEmbeddedLogin = false
                 return
             }
             if raw.lowercased().contains("cancel") {
@@ -268,29 +277,12 @@ struct AddAccountSheet: View {
                 working = false
                 error = ""
                 step = .credentials
-                useEmbeddedLogin = false
-                return
-            }
-            if raw.contains("ADMIN_CONSENT_ONLY") {
-                browser = nil
-                useEmbeddedLogin = false
-                step = .credentials
-                startMicrosoftSignIn(prompt: "login")
-                return
-            }
-            if MicrosoftOAuth.isAdminConsentError(raw), consentRetries < 1 {
-                consentRetries += 1
-                browser = nil
-                useEmbeddedLogin = false
-                step = .credentials
-                startMicrosoftSignIn(prompt: "admin_consent")
                 return
             }
             error = MicrosoftOAuth.friendlyError(raw)
             verifying = false
             working = false
             step = .credentials
-            useEmbeddedLogin = false
         case .success(let code):
             verifying = true
             working = true
@@ -309,23 +301,12 @@ struct AddAccountSheet: View {
                     context: context,
                     existing: Array(accounts)
                 )
-                dismiss()
+                connectedEmail = tokens.email
+                showConnected = true
             } catch {
-                let msg = error.localizedDescription
-                if MicrosoftOAuth.isAdminConsentError(msg), consentRetries < 1 {
-                    consentRetries += 1
-                    browser = nil
-                    verifying = false
-                    working = false
-                    useEmbeddedLogin = false
-                    step = .credentials
-                    startMicrosoftSignIn(prompt: "admin_consent")
-                    return
-                }
                 self.error = MailSyncService.friendlyMailError(error)
                 mail.lastError = self.error
                 step = .credentials
-                useEmbeddedLogin = false
             }
             verifying = false
             working = false
@@ -352,7 +333,7 @@ struct AddAccountSheet: View {
     }
 }
 
-/// System auth sheet. Returns false if iOS refuses to present (caller falls back to WebView).
+/// System auth sheet for the complete Microsoft browser and Authenticator round trip.
 @MainActor
 final class MicrosoftAuthSessionController: NSObject, ASWebAuthenticationPresentationContextProviding {
     private var session: ASWebAuthenticationSession?
@@ -360,7 +341,8 @@ final class MicrosoftAuthSessionController: NSObject, ASWebAuthenticationPresent
     @discardableResult
     func start(url: URL, completion: @escaping (Result<String, Error>) -> Void) -> Bool {
         session?.cancel()
-        let handler: ASWebAuthenticationSession.CompletionHandler = { callbackURL, error in
+        let handler: ASWebAuthenticationSession.CompletionHandler = { [weak self] callbackURL, error in
+            self?.session = nil
             if let error {
                 completion(.failure(error))
                 return
@@ -403,62 +385,6 @@ final class MicrosoftAuthSessionController: NSObject, ASWebAuthenticationPresent
         if let key = windows.first(where: \.isKeyWindow) { return key }
         if let front = windows.max(by: { $0.windowLevel.rawValue < $1.windowLevel.rawValue }) { return front }
         return windows.first ?? ASPresentationAnchor()
-    }
-}
-
-/// Fallback when ASWebAuthenticationSession will not present from a sheet.
-/// Forwards Authenticator (`msauth`) URLs to the system; never scrapes page text for false errors.
-private struct MicrosoftLoginWebView: UIViewRepresentable {
-    let startURL: URL
-    let onResult: (Result<String, Error>) -> Void
-
-    func makeCoordinator() -> Coord { Coord(onResult: onResult) }
-
-    func makeUIView(context: Context) -> WKWebView {
-        let config = WKWebViewConfiguration()
-        config.defaultWebpagePreferences.allowsContentJavaScript = true
-        let view = WKWebView(frame: .zero, configuration: config)
-        view.navigationDelegate = context.coordinator
-        view.load(URLRequest(url: startURL))
-        return view
-    }
-
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-
-    final class Coord: NSObject, WKNavigationDelegate {
-        let onResult: (Result<String, Error>) -> Void
-        private var finished = false
-
-        init(onResult: @escaping (Result<String, Error>) -> Void) {
-            self.onResult = onResult
-        }
-
-        func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction, decisionHandler: @escaping (WKNavigationActionPolicy) -> Void) {
-            guard let url = navigationAction.request.url else {
-                decisionHandler(.allow)
-                return
-            }
-            if let parsed = MicrosoftOAuth.codeFromRedirect(url) {
-                decisionHandler(.cancel)
-                guard !finished else { return }
-                finished = true
-                onResult(parsed)
-                return
-            }
-            let scheme = (url.scheme ?? "").lowercased()
-            // Hand Authenticator / broker URLs to iOS (WKWebView cannot complete MFA alone).
-            if scheme.hasPrefix("msauth") || scheme == "microsoft-authenticator" || scheme == "companyportal" {
-                UIApplication.shared.open(url, options: [:]) { ok in
-                    if !ok, !self.finished {
-                        self.finished = true
-                        self.onResult(.failure(MailError.auth("Could not open Microsoft Authenticator. Install or unlock it, then try Sign In again.")))
-                    }
-                }
-                decisionHandler(.cancel)
-                return
-            }
-            decisionHandler(.allow)
-        }
     }
 }
 

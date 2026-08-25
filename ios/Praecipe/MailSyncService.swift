@@ -261,22 +261,22 @@ final class MailSyncService: ObservableObject {
             throw MailError.auth("Microsoft 365 is missing from this build.")
         }
         lastError = nil
-        status = "Verifying"
+        status = "Verifying Inbox access…"
         busy = true
-        var imapOK = false
         do {
-            try MicrosoftOAuth.storeTokens(email: email, access: access, refresh: refresh, expires: expires)
             try await transport.verify(
                 host: provider.imapHost,
                 port: Int(provider.imapPort) ?? 993,
                 user: email,
                 credentials: .oauth(accessToken: access)
             )
-            imapOK = true
+            try MicrosoftOAuth.storeTokens(email: email, access: access, refresh: refresh, expires: expires)
         } catch {
-            // Keep the Microsoft session even if IMAP verify fails once — account still saves.
+            MicrosoftOAuth.clearTokens(email: email)
+            busy = false
             lastError = Self.friendlyMailError(error)
             status = lastError ?? ""
+            throw error
         }
         let key = email.lowercased()
         let account: MailAccount
@@ -301,13 +301,16 @@ final class MailSyncService: ObservableObject {
             other.isDefault = false
         }
         account.isDefault = true
-        try context.save()
-        busy = false
-        status = imapOK ? "Fetching Mail…" : "Signed In — Getting Mail…"
-        await sync(context: context)
-        if !imapOK, lastError == nil {
-            lastError = nil
+        do {
+            try context.save()
+        } catch {
+            MicrosoftOAuth.clearTokens(email: email)
+            busy = false
+            throw error
         }
+        busy = false
+        status = "Signed in · Inbox verified · Fetching mail…"
+        await sync(context: context)
     }
 
     func markRead(_ message: MailMessage, context: ModelContext) async {
