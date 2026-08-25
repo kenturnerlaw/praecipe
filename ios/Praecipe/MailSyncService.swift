@@ -3,10 +3,13 @@ import SwiftData
 
 @MainActor
 final class MailSyncService: ObservableObject {
-    @Published var status = "Ready"
+    @Published var status = ""
     @Published var busy = false
+    @Published var lastError: String?
+    @Published var needsSignIn = false
     private let transport = MailTransport()
     private var pollTask: Task<Void, Never>?
+    private var imapAuthRetried = false
 
     func startPolling(context: ModelContext) {
         pollTask?.cancel()
@@ -25,54 +28,347 @@ final class MailSyncService: ObservableObject {
         let accounts = (try? context.fetch(FetchDescriptor<MailAccount>())) ?? []
         let enabled = accounts.filter(\.enabled)
         guard let account = enabled.first(where: \.isDefault) ?? enabled.first else {
-            status = "Add a mailbox in Settings."
+            status = ""
+            lastError = nil
+            needsSignIn = false
             return
         }
-        let password = KeychainStore.password(account: account.email)
-        guard !password.isEmpty else {
-            status = "Mailbox password missing."
-            return
-        }
+        await syncSelectedFolder(for: account, context: context, includeInbox: true)
+    }
+
+    func syncSelectedFolder(for account: MailAccount, context: ModelContext, includeInbox: Bool = false) async {
+        guard !busy else { return }
+        lastError = nil
+        needsSignIn = false
         busy = true
         status = "Getting mail…"
+        var added = 0
         do {
-            let folders = ["INBOX", "Sent", "SENT", "[Gmail]/Sent Mail"]
-            var added = 0
-            for folder in Array(Set(folders)) {
-                let (exists, envelopes, boxes) = try await transport.fetchLatest(
-                    host: account.imapHost,
-                    port: Int(account.imapPort) ?? 993,
-                    user: account.imapUser,
-                    password: password,
-                    folder: folder,
-                    afterUID: folder.uppercased() == "INBOX" ? account.lastUID : 0
-                )
-                if !boxes.isEmpty { _ = boxes }
-                guard exists else { continue }
-                for env in envelopes {
-                    added += upsert(env, account: account, folder: folder == "INBOX" ? "INBOX" : folderRole(folder), context: context)
-                    if folder.uppercased() == "INBOX", let n = Int(env.uid) {
-                        account.lastUID = max(account.lastUID, n)
-                    }
+            let credentials = try await credentials(for: account, context: context)
+            let imapNames = try await transport.listMailboxes(
+                host: account.imapHost,
+                port: Int(account.imapPort) ?? 993,
+                user: account.imapUser.isEmpty ? account.email : account.imapUser,
+                credentials: credentials
+            )
+            let folders = MailFolders.build(from: imapNames)
+            let role = account.selectedFolderRole.isEmpty ? "INBOX" : account.selectedFolderRole
+            let imap = account.selectedFolderIMAP.isEmpty
+                ? (MailFolders.imapName(forRole: role, in: folders) ?? role)
+                : account.selectedFolderIMAP
+
+            var toSync: [(imap: String, role: String)] = []
+            if includeInbox, role != "INBOX", role != "FLAGGED" {
+                if let inbox = MailFolders.imapName(forRole: "INBOX", in: folders)
+                    ?? imapNames.first(where: { $0.uppercased() == "INBOX" }) {
+                    toSync.append((inbox, "INBOX"))
                 }
             }
+            if role == "FLAGGED" {
+                if let inbox = MailFolders.imapName(forRole: "INBOX", in: folders)
+                    ?? imapNames.first(where: { $0.uppercased() == "INBOX" }) {
+                    toSync.append((inbox, "INBOX"))
+                }
+            } else {
+                toSync.append((imap, role))
+            }
+
+            var seen = Set<String>()
+            for item in toSync {
+                let key = "\(item.imap.lowercased())|\(item.role)"
+                guard seen.insert(key).inserted else { continue }
+                added += try await fetchFolder(
+                    imapName: item.imap,
+                    role: item.role,
+                    account: account,
+                    credentials: credentials,
+                    context: context
+                )
+            }
             try context.save()
-            status = added == 0 ? "Up to date." : "Added \(added) message(s)."
+            status = added == 0 ? "Updated just now" : "Updated · \(added) new"
+            lastError = nil
         } catch {
-            status = error.localizedDescription
+            if await retryAfterIMAPAuthFailure(error, account: account, context: context) {
+                busy = false
+                return
+            }
+            lastError = Self.friendlyMailError(error)
+            needsSignIn = Self.isReauthError(error)
+            status = lastError ?? ""
         }
         busy = false
     }
 
+    func syncFolder(role: String, imapName: String, account: MailAccount, context: ModelContext) async {
+        guard !busy else { return }
+        lastError = nil
+        needsSignIn = false
+        busy = true
+        status = "Getting \(MailFolders.displayName(for: role))…"
+        do {
+            let credentials = try await credentials(for: account, context: context)
+            let added = try await fetchFolder(
+                imapName: imapName,
+                role: role,
+                account: account,
+                credentials: credentials,
+                context: context
+            )
+            account.selectedFolderRole = role
+            account.selectedFolderIMAP = imapName
+            try context.save()
+            status = added == 0 ? "Updated just now" : "Updated · \(added) new"
+            lastError = nil
+        } catch {
+            if await retryAfterIMAPAuthFailure(error, account: account, context: context, role: role, imapName: imapName) {
+                busy = false
+                return
+            }
+            lastError = Self.friendlyMailError(error)
+            needsSignIn = Self.isReauthError(error)
+            status = lastError ?? ""
+        }
+        busy = false
+    }
+
+    func loadFolderItems(for account: MailAccount, context: ModelContext) async -> [MailFolderItem] {
+        do {
+            let credentials = try await credentials(for: account, context: context)
+            let imapNames = try await transport.listMailboxes(
+                host: account.imapHost,
+                port: Int(account.imapPort) ?? 993,
+                user: account.imapUser.isEmpty ? account.email : account.imapUser,
+                credentials: credentials
+            )
+            return MailFolders.build(from: imapNames)
+        } catch {
+            lastError = error.localizedDescription
+            return MailFolders.fallback()
+        }
+    }
+
+    private func fetchFolder(
+        imapName: String,
+        role: String,
+        account: MailAccount,
+        credentials: MailCredentials,
+        context: ModelContext
+    ) async throws -> Int {
+        // If the local folder is empty (e.g. after a SwiftData wipe), do not trust
+        // lastUID — that would search only for newer UIDs and leave Inbox blank.
+        let localCount = localMessageCount(accountEmail: account.email, folder: role, context: context)
+        var afterUID = 0
+        if role == "INBOX", localCount > 0 {
+            afterUID = account.lastUID
+        } else if role == "INBOX", localCount == 0 {
+            account.lastUID = 0
+        }
+        let (exists, envelopes, _) = try await transport.fetchLatest(
+            host: account.imapHost,
+            port: Int(account.imapPort) ?? 993,
+            user: account.imapUser.isEmpty ? account.email : account.imapUser,
+            credentials: credentials,
+            folder: imapName,
+            afterUID: afterUID
+        )
+        guard exists else { return 0 }
+        var added = 0
+        for env in envelopes {
+            added += upsert(env, account: account, folder: role, context: context)
+            if role == "INBOX", let n = Int(env.uid) {
+                account.lastUID = max(account.lastUID, n)
+            }
+        }
+        return added
+    }
+
+    private func localMessageCount(accountEmail: String, folder: String, context: ModelContext) -> Int {
+        let email = accountEmail
+        let role = folder
+        let descriptor = FetchDescriptor<MailMessage>(predicate: #Predicate { msg in
+            msg.accountEmail == email && msg.folder == role && msg.deleted == false
+        })
+        return (try? context.fetchCount(descriptor)) ?? 0
+    }
+
+    func verifyAndAdd(
+        provider: MailProvider,
+        email: String,
+        password: String,
+        imapUser: String,
+        context: ModelContext,
+        existing: [MailAccount]
+    ) async throws {
+        let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = imapUser.isEmpty ? email : imapUser
+        lastError = nil
+        status = "Signing In…"
+        busy = true
+        do {
+            try await transport.verify(
+                host: provider.imapHost,
+                port: Int(provider.imapPort) ?? 993,
+                user: user,
+                credentials: .password(password)
+            )
+            try KeychainStore.savePassword(password, account: email)
+        } catch {
+            busy = false
+            lastError = error.localizedDescription
+            status = error.localizedDescription
+            throw error
+        }
+        let key = email.lowercased()
+        let account: MailAccount
+        if let found = existing.first(where: { $0.email.lowercased() == key }) {
+            account = found
+        } else {
+            account = MailAccount(provider: provider.id, email: email)
+            context.insert(account)
+        }
+        account.provider = provider.id
+        account.email = email
+        account.imapHost = provider.imapHost
+        account.imapPort = provider.imapPort
+        account.smtpHost = provider.smtpHost
+        account.smtpPort = provider.smtpPort
+        account.smtpTLS = provider.smtpTLS
+        account.imapUser = user
+        account.smtpUser = email
+        account.authType = "password"
+        account.enabled = true
+        KeychainStore.saveAccountMeta(email: email, provider: provider.id, authType: "password")
+        for other in existing where other.persistentModelID != account.persistentModelID {
+            other.isDefault = false
+        }
+        account.isDefault = true
+        try context.save()
+        busy = false
+        status = "Signed In — Fetching Mail…"
+        await sync(context: context)
+    }
+
+    func finishMicrosoft(
+        email: String,
+        access: String,
+        refresh: String,
+        expires: Date,
+        context: ModelContext,
+        existing: [MailAccount]
+    ) async throws {
+        guard let provider = MailProvider.named("microsoft") else {
+            throw MailError.auth("Microsoft 365 is missing from this build.")
+        }
+        lastError = nil
+        status = "Verifying"
+        busy = true
+        var imapOK = false
+        do {
+            try MicrosoftOAuth.storeTokens(email: email, access: access, refresh: refresh, expires: expires)
+            try await transport.verify(
+                host: provider.imapHost,
+                port: Int(provider.imapPort) ?? 993,
+                user: email,
+                credentials: .oauth(accessToken: access)
+            )
+            imapOK = true
+        } catch {
+            // Keep the Microsoft session even if IMAP verify fails once — account still saves.
+            lastError = Self.friendlyMailError(error)
+            status = lastError ?? ""
+        }
+        let key = email.lowercased()
+        let account: MailAccount
+        if let found = existing.first(where: { $0.email.lowercased() == key }) {
+            account = found
+        } else {
+            account = MailAccount(provider: "microsoft", email: email)
+            context.insert(account)
+        }
+        account.provider = "microsoft"
+        account.email = email
+        account.imapHost = provider.imapHost
+        account.imapPort = provider.imapPort
+        account.smtpHost = provider.smtpHost
+        account.smtpPort = provider.smtpPort
+        account.smtpTLS = provider.smtpTLS
+        account.imapUser = email
+        account.smtpUser = email
+        account.authType = "oauth"
+        account.enabled = true
+        for other in existing where other.persistentModelID != account.persistentModelID {
+            other.isDefault = false
+        }
+        account.isDefault = true
+        try context.save()
+        busy = false
+        status = imapOK ? "Fetching Mail…" : "Signed In — Getting Mail…"
+        await sync(context: context)
+        if !imapOK, lastError == nil {
+            lastError = nil
+        }
+    }
+
+    func markRead(_ message: MailMessage, context: ModelContext) async {
+        guard !message.seen else { return }
+        await toggleFlag(message, flag: "Seen", add: true, context: context)
+    }
+
+    func markUnread(_ message: MailMessage, context: ModelContext) async {
+        guard message.seen else { return }
+        await toggleFlag(message, flag: "Seen", add: false, context: context)
+    }
+
+    func archiveMessage(_ message: MailMessage, context: ModelContext) async {
+        await relocate(message, role: .archive, context: context)
+    }
+
+    func moveMessage(_ message: MailMessage, toFolder dest: String, context: ModelContext) async {
+        guard let account = account(for: message, context: context) else { return }
+        do {
+            let credentials = try await credentials(for: account, context: context)
+            try await transport.moveUID(
+                host: account.imapHost,
+                port: Int(account.imapPort) ?? 993,
+                user: account.imapUser.isEmpty ? account.email : account.imapUser,
+                credentials: credentials,
+                fromFolder: message.folder,
+                uid: message.imapUID,
+                destHints: [dest]
+            )
+            message.folder = MailFolders.role(for: dest)
+            try? context.save()
+        } catch {
+            status = error.localizedDescription
+            lastError = error.localizedDescription
+        }
+    }
+
+    func listFolders(for account: MailAccount, context: ModelContext) async -> [String] {
+        do {
+            let credentials = try await credentials(for: account, context: context)
+            return try await transport.listMailboxes(
+                host: account.imapHost,
+                port: Int(account.imapPort) ?? 993,
+                user: account.imapUser.isEmpty ? account.email : account.imapUser,
+                credentials: credentials
+            )
+        } catch {
+            status = error.localizedDescription
+            return []
+        }
+    }
+
     func toggleFlag(_ message: MailMessage, flag: String, add: Bool, context: ModelContext) async {
         guard let account = account(for: message, context: context) else { return }
-        let password = KeychainStore.password(account: account.email)
         do {
+            let credentials = try await credentials(for: account, context: context)
             try await transport.setFlag(
                 host: account.imapHost,
                 port: Int(account.imapPort) ?? 993,
-                user: account.imapUser,
-                password: password,
+                user: account.imapUser.isEmpty ? account.email : account.imapUser,
+                credentials: credentials,
                 folder: message.folder,
                 uid: message.imapUID,
                 flag: "\\" + flag,
@@ -86,8 +382,53 @@ final class MailSyncService: ObservableObject {
         }
     }
 
+    func deleteMessage(_ message: MailMessage, context: ModelContext) async {
+        await relocate(message, role: .trash, context: context)
+    }
+
+    func junkMessage(_ message: MailMessage, context: ModelContext) async {
+        await relocate(message, role: .junk, context: context)
+    }
+
+    private enum RelocateRole { case trash, junk, archive }
+
+    private func relocate(_ message: MailMessage, role: RelocateRole, context: ModelContext) async {
+        guard let account = account(for: message, context: context) else { return }
+        let dest: [String]
+        let localFolder: String
+        switch role {
+        case .trash:
+            dest = ["Deleted Items", "Trash", "Deleted", "[Gmail]/Trash"]
+            localFolder = "TRASH"
+        case .junk:
+            dest = ["Junk Email", "Junk", "Spam", "Junk E-mail", "[Gmail]/Spam"]
+            localFolder = "JUNK"
+        case .archive:
+            dest = ["Archive", "[Gmail]/All Mail", "All Mail"]
+            localFolder = "ARCHIVE"
+        }
+        do {
+            let credentials = try await credentials(for: account, context: context)
+            try await transport.moveUID(
+                host: account.imapHost,
+                port: Int(account.imapPort) ?? 993,
+                user: account.imapUser.isEmpty ? account.email : account.imapUser,
+                credentials: credentials,
+                fromFolder: message.folder,
+                uid: message.imapUID,
+                destHints: dest
+            )
+            message.deleted = role != .archive
+            message.folder = localFolder
+            try? context.save()
+        } catch {
+            status = error.localizedDescription
+            lastError = error.localizedDescription
+        }
+    }
+
     func send(from account: MailAccount, to: [String], cc: [String] = [], subject: String, body: String, inReplyTo: String = "", references: String = "") async throws {
-        let password = KeychainStore.password(account: account.email)
+        let credentials = try await credentials(for: account)
         let fromHeader = account.displayName.isEmpty ? account.email : "\(account.displayName) <\(account.email)>"
         let raw = RFC822.buildRaw(from: fromHeader, to: to, cc: cc, subject: subject, body: body, inReplyTo: inReplyTo, references: references)
         try await transport.sendMail(
@@ -95,11 +436,95 @@ final class MailSyncService: ObservableObject {
             port: Int(account.smtpPort) ?? 587,
             tls: account.smtpTLS,
             user: account.smtpUser.isEmpty ? account.email : account.smtpUser,
-            password: password,
+            credentials: credentials,
             from: account.email,
             to: to + cc,
             raw: raw
         )
+    }
+
+    private func credentials(for account: MailAccount, context: ModelContext? = nil) async throws -> MailCredentials {
+        if account.authType == "oauth" || account.provider == "microsoft" {
+            let token = try await MicrosoftOAuth.accessToken(for: account)
+            try context?.save()
+            return .oauth(accessToken: token)
+        }
+        let password = KeychainStore.load(account: account.email)
+        guard !password.isEmpty else {
+            throw MailError.auth("The password for \(account.email) is not saved. Sign in again.")
+        }
+        return .password(password)
+    }
+
+    /// Bad OAuth audience after admin_consent: drop access token, refresh once, re-sync.
+    private func retryAfterIMAPAuthFailure(
+        _ error: Error,
+        account: MailAccount,
+        context: ModelContext,
+        role: String? = nil,
+        imapName: String? = nil
+    ) async -> Bool {
+        let raw = error.localizedDescription
+        guard raw == "IMAP_AUTH_REJECTED" || raw.lowercased().contains("imap_auth_rejected") else {
+            return false
+        }
+        guard !imapAuthRetried else {
+            MicrosoftOAuth.clearTokens(email: account.email)
+            lastError = "Microsoft sign-in is not valid for mail. Tap Sign In and Accept again."
+            needsSignIn = true
+            status = lastError ?? ""
+            return true
+        }
+        imapAuthRetried = true
+        MicrosoftOAuth.clearAccessToken(email: account.email)
+        do {
+            _ = try await MicrosoftOAuth.accessToken(for: account, forceRefresh: true)
+            if let role, let imapName {
+                let credentials = try await credentials(for: account, context: context)
+                let added = try await fetchFolder(
+                    imapName: imapName,
+                    role: role,
+                    account: account,
+                    credentials: credentials,
+                    context: context
+                )
+                account.selectedFolderRole = role
+                account.selectedFolderIMAP = imapName
+                try context.save()
+                status = added == 0 ? "Updated just now" : "Updated · \(added) new"
+                lastError = nil
+                needsSignIn = false
+                return true
+            }
+            busy = false
+            await syncSelectedFolder(for: account, context: context, includeInbox: true)
+            return true
+        } catch {
+            MicrosoftOAuth.clearTokens(email: account.email)
+            lastError = "Microsoft sign-in is not valid for mail. Tap Sign In and Accept again."
+            needsSignIn = true
+            status = lastError ?? ""
+            return true
+        }
+    }
+
+    private static func isReauthError(_ error: Error) -> Bool {
+        let m = error.localizedDescription.lowercased()
+        return m.contains("invalid_grant")
+            || m.contains("sign in again")
+            || m.contains("sign-in expired")
+            || m.contains("imap_auth_rejected")
+            || m.contains("not valid for outlook")
+            || m.contains("cannot open mail")
+    }
+
+    /// Map transport codes to user-facing copy; never blame “enable IMAP” for a bad OAuth token.
+    static func friendlyMailError(_ error: Error) -> String {
+        let m = error.localizedDescription
+        if m == "IMAP_AUTH_REJECTED" || m.lowercased().contains("imap_auth_rejected") {
+            return "Microsoft sign-in is not valid for mail. Tap Sign In and Accept again."
+        }
+        return MicrosoftOAuth.friendlyError(m)
     }
 
     private func account(for message: MailMessage, context: ModelContext) -> MailAccount? {
@@ -109,11 +534,7 @@ final class MailSyncService: ObservableObject {
     }
 
     private func folderRole(_ name: String) -> String {
-        let n = name.lowercased()
-        if n.contains("sent") { return "SENT" }
-        if n.contains("draft") { return "DRAFTS" }
-        if n.contains("trash") || n.contains("deleted") { return "TRASH" }
-        return name
+        MailFolders.role(for: name)
     }
 
     @discardableResult

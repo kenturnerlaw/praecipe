@@ -3,10 +3,10 @@ import SwiftData
 
 struct FileBillResult {
     var connected = false
-    var saved: [String] = []
-    var downloaded: [String] = []
+    var savedFiles: [URL] = []
+    var downloadedFiles: [URL] = []
     var emailed: String?
-    var minutes: Double?
+    var hours: Double?
     var error: String?
 }
 
@@ -22,7 +22,7 @@ enum FileAndBill {
         emailClient: Bool,
         clientEmail: String,
         addTime: Bool,
-        minutes: Double,
+        hours: Double,
         activity: String,
         context: ModelContext,
         mail: MailSyncService,
@@ -36,8 +36,8 @@ enum FileAndBill {
         if saveAttachments {
             for att in message.attachments {
                 if let saved = save(data: att.data, filename: att.filename, matter: matter, docType: docType, source: "mail", message: message, context: context) {
-                    result.saved.append(saved)
-                    att.savedRelativePath = saved
+                    result.savedFiles.append(saved.url)
+                    att.savedRelativePath = saved.filename
                 }
             }
         }
@@ -47,7 +47,7 @@ enum FileAndBill {
                     let (data, response) = try await URLSession.shared.data(from: found.url)
                     let name = found.url.lastPathComponent.isEmpty ? "service-document.pdf" : found.url.lastPathComponent
                     if let saved = save(data: data, filename: name, matter: matter, docType: .service, source: "url", message: message, context: context, sourceURL: found.url.absoluteString) {
-                        result.downloaded.append(saved)
+                        result.downloadedFiles.append(saved.url)
                     }
                     _ = response
                 } catch {
@@ -56,12 +56,22 @@ enum FileAndBill {
             }
         }
         if addTime {
-            let entry = TimeEntry(minutes: minutes > 0 ? minutes : 12, activity: activity, description: message.subject)
-            entry.matter = matter
-            entry.message = message
-            entry.rate = matter.rate
-            context.insert(entry)
-            result.minutes = entry.minutes
+            if let existing = existingTimeEntry(for: message, context: context) {
+                message.timeBilled = true
+                result.hours = existing.hours
+            } else if message.timeBilled {
+                // Flag set without a linked entry (legacy / partial save) — do not create a second bill.
+                result.hours = nil
+            } else {
+                let billedHours = hours > 0 ? hours : LegalTime.defaultHours
+                let entry = TimeEntry(minutes: LegalTime.minutes(fromHours: billedHours), activity: activity, description: message.subject)
+                entry.matter = matter
+                entry.message = message
+                entry.rate = matter.rate
+                context.insert(entry)
+                message.timeBilled = true
+                result.hours = entry.hours
+            }
         }
         if emailClient {
             let addr = clientEmail.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -92,7 +102,28 @@ enum FileAndBill {
         return (all.first(where: \.isDefault) ?? all.first)?.body
     }
 
-    static func save(data: Data?, filename: String, matter: Matter, docType: DocType, source: String, message: MailMessage?, context: ModelContext, sourceURL: String = "") -> String? {
+    /// One File & Bill time entry per message (idempotent).
+    static func existingTimeEntry(for message: MailMessage, context: ModelContext) -> TimeEntry? {
+        let messageID = message.persistentModelID
+        let entries = (try? context.fetch(FetchDescriptor<TimeEntry>())) ?? []
+        return entries.first { $0.message?.persistentModelID == messageID }
+    }
+
+    static func isTimeBilled(_ message: MailMessage, context: ModelContext) -> Bool {
+        if message.timeBilled { return true }
+        if existingTimeEntry(for: message, context: context) != nil {
+            message.timeBilled = true
+            return true
+        }
+        return false
+    }
+
+    struct SavedFile {
+        let filename: String
+        let url: URL
+    }
+
+    static func save(data: Data?, filename: String, matter: Matter, docType: DocType, source: String, message: MailMessage?, context: ModelContext, sourceURL: String = "") -> SavedFile? {
         guard let data, !data.isEmpty else { return nil }
         let safeMatter = matter.caseNo.isEmpty ? "matter" : matter.caseNo.replacingOccurrences(of: "/", with: "-")
         let dir = AppStore.filesRoot
@@ -108,7 +139,7 @@ enum FileAndBill {
             rec.message = message
             rec.sourceURL = sourceURL
             context.insert(rec)
-            return filename
+            return SavedFile(filename: filename, url: dest)
         } catch {
             return nil
         }

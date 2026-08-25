@@ -19,6 +19,8 @@ final class MailAccount {
     var enabled: Bool
     var createdAt: Date
     var lastUID: Int
+    var selectedFolderRole: String
+    var selectedFolderIMAP: String
 
     init(provider: String, email: String, displayName: String = "") {
         self.provider = provider
@@ -37,6 +39,8 @@ final class MailAccount {
         self.enabled = true
         self.createdAt = Date()
         self.lastUID = 0
+        self.selectedFolderRole = "INBOX"
+        self.selectedFolderIMAP = "INBOX"
     }
 }
 
@@ -55,29 +59,68 @@ final class Matter {
     var clientName: String
     var rate: Double
     var notes: String
+    /// Destrier-style case type (e.g. "DOM - Dissolution of Marriage").
+    var caseType: String
     var createdAt: Date
 
-    init(caseNo: String = "", style: String = "", status: String = "open") {
+    init(caseNo: String = "", style: String = "", status: String = "Open") {
         self.caseNo = caseNo
         self.petitioner = ""
         self.respondent = ""
         self.style = style
         self.court = "Circuit Court"
-        self.county = ""
+        self.county = "Collier"
         self.division = "Family"
         self.status = status
         self.opposingCounsel = ""
         self.clientEmail = ""
         self.clientName = ""
-        self.rate = 0
+        self.rate = 350
         self.notes = ""
+        self.caseType = CaseType.dom.rawValue
         self.createdAt = Date()
     }
 
     var label: String {
         if !caseNo.isEmpty { return "\(caseNo) — \(style.isEmpty ? "Matter" : style)" }
-        return style.isEmpty ? "Matter" : style
+        if !style.isEmpty { return style }
+        if !caseType.isEmpty {
+            let code = caseType.components(separatedBy: " - ").first ?? caseType
+            return "\(code) · \(county.isEmpty ? "Matter" : county)"
+        }
+        return "Matter"
     }
+
+    var isIntake: Bool {
+        caseNo.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "INTAKE"
+    }
+}
+
+enum CaseType: String, CaseIterable, Identifiable {
+    case dom = "DOM - Dissolution of Marriage"
+    case pat = "PAT - Paternity"
+    case mod = "MOD - Modification"
+    case enf = "ENF - Enforcement / Contempt"
+    case sup = "SUP - Support"
+    case inj = "INJ - Injunction"
+    case adp = "ADP - Adoption"
+    case oth = "OTH - Other"
+    var id: String { rawValue }
+    var code: String { rawValue.components(separatedBy: " - ").first ?? rawValue }
+}
+
+enum FloridaCounties {
+    static let all = [
+        "Alachua", "Baker", "Bay", "Bradford", "Brevard", "Broward", "Calhoun", "Charlotte",
+        "Citrus", "Clay", "Collier", "Columbia", "DeSoto", "Dixie", "Duval", "Escambia",
+        "Flagler", "Franklin", "Gadsden", "Gilchrist", "Glades", "Gulf", "Hamilton", "Hardee",
+        "Hendry", "Hernando", "Highlands", "Hillsborough", "Holmes", "Indian River", "Jackson",
+        "Jefferson", "Lafayette", "Lake", "Lee", "Leon", "Levy", "Liberty", "Madison", "Manatee",
+        "Marion", "Martin", "Miami-Dade", "Monroe", "Nassau", "Okaloosa", "Okeechobee", "Orange",
+        "Osceola", "Palm Beach", "Pasco", "Pinellas", "Polk", "Putnam", "Santa Rosa", "Sarasota",
+        "Seminole", "St. Johns", "St. Lucie", "Sumter", "Suwannee", "Taylor", "Union", "Volusia",
+        "Wakulla", "Walton", "Washington",
+    ]
 }
 
 @Model
@@ -105,6 +148,8 @@ final class MailMessage {
     var hasAttachments: Bool
     var labelsJSON: String
     var syncedAt: Date
+    /// True once File & Bill (or message detail) has recorded time for this email — blocks a second time entry.
+    var timeBilled: Bool
     var matter: Matter?
 
     @Relationship(deleteRule: .cascade) var attachments: [MailAttachment]
@@ -133,6 +178,7 @@ final class MailMessage {
         self.hasAttachments = false
         self.labelsJSON = "[]"
         self.syncedAt = Date()
+        self.timeBilled = false
         self.attachments = []
     }
 }
@@ -180,6 +226,44 @@ final class TimeEntry {
     }
 
     var fee: Double { minutes / 60.0 * rate }
+
+    var hours: Double { LegalTime.hours(fromMinutes: minutes) }
+
+    func setHours(_ hours: Double) {
+        minutes = LegalTime.minutes(fromHours: hours)
+    }
+}
+
+enum LegalTime {
+    static let defaultHours: Double = 0.2
+    static let minimumHours: Double = 0.1
+    static let increment: Double = 0.1
+
+    static func minutes(fromHours hours: Double) -> Double {
+        max(minimumHours, hours) * 60
+    }
+
+    static func hours(fromMinutes minutes: Double) -> Double {
+        guard minutes > 0 else { return 0 }
+        let tenths = (minutes / 60 * 10).rounded()
+        return max(minimumHours, tenths / 10)
+    }
+
+    static func roundMinutes(_ rawMinutes: Double) -> Double {
+        LegalTime.minutes(fromHours: hours(fromMinutes: rawMinutes))
+    }
+
+    static func displayHours(_ hours: Double) -> String {
+        String(format: "%.1f hr", hours)
+    }
+
+    static func displayMinutes(fromHours hours: Double) -> String {
+        "\(Int((hours * 60).rounded())) min"
+    }
+
+    static func displayBoth(_ hours: Double) -> String {
+        "\(displayHours(hours)) (\(displayMinutes(fromHours: hours)))"
+    }
 }
 
 @Model

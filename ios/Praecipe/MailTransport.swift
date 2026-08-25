@@ -18,13 +18,18 @@ struct IMAPEnvelope {
     var rfc822: Data
 }
 
-/// IMAP (993 TLS) and SMTP (465 SSL or 587 STARTTLS) for app-password accounts.
+enum MailCredentials {
+    case password(String)
+    case oauth(accessToken: String)
+}
+
+/// IMAP (993 TLS) and SMTP (465 SSL or 587 STARTTLS). Microsoft 365 uses XOAUTH2, not LOGIN.
 actor MailTransport {
-    func fetchLatest(host: String, port: Int, user: String, password: String, folder: String, afterUID: Int, limit: Int = 50) async throws -> (Bool, [IMAPEnvelope], [String]) {
+    func fetchLatest(host: String, port: Int, user: String, credentials: MailCredentials, folder: String, afterUID: Int, limit: Int = 50) async throws -> (Bool, [IMAPEnvelope], [String]) {
         let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
         defer { conn.close() }
         _ = try conn.readLine()
-        try imapLogin(conn, user: user, password: password)
+        try imapSignIn(conn, user: user, credentials: credentials)
         let boxes = try imapList(conn)
         let selectName = boxes.first(where: { $0.caseInsensitiveCompare(folder) == .orderedSame }) ?? folder
         guard try imapOK(conn, "SELECT \(imapQuote(selectName))") else {
@@ -40,18 +45,77 @@ actor MailTransport {
         return (true, out, boxes)
     }
 
-    func setFlag(host: String, port: Int, user: String, password: String, folder: String, uid: String, flag: String, add: Bool) async throws {
+    func verify(host: String, port: Int, user: String, credentials: MailCredentials) async throws {
         let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
         defer { conn.close() }
         _ = try conn.readLine()
-        try imapLogin(conn, user: user, password: password)
+        try imapSignIn(conn, user: user, credentials: credentials)
+        guard try imapOK(conn, "SELECT \(imapQuote("INBOX"))") else {
+            throw MailError.protocolFailure("Signed in, but Inbox would not open.")
+        }
+        _ = try? conn.command("LOGOUT")
+    }
+
+    func listMailboxes(host: String, port: Int, user: String, credentials: MailCredentials) async throws -> [String] {
+        let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
+        defer { conn.close() }
+        _ = try conn.readLine()
+        try imapSignIn(conn, user: user, credentials: credentials)
+        let boxes = try imapList(conn)
+        _ = try? conn.command("LOGOUT")
+        return boxes.sorted { $0.localizedCaseInsensitiveCompare($1) == .orderedAscending }
+    }
+
+    func setFlag(host: String, port: Int, user: String, credentials: MailCredentials, folder: String, uid: String, flag: String, add: Bool) async throws {
+        let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
+        defer { conn.close() }
+        _ = try conn.readLine()
+        try imapSignIn(conn, user: user, credentials: credentials)
         _ = try imapOK(conn, "SELECT \(imapQuote(folder))")
         let op = add ? "+FLAGS.SILENT" : "-FLAGS.SILENT"
         _ = try conn.command("UID STORE \(uid) \(op) (\(flag))")
         _ = try? conn.command("LOGOUT")
     }
 
-    func sendMail(host: String, port: Int, tls: String, user: String, password: String, from: String, to: [String], raw: String) async throws {
+    /// Move a message to Junk/Spam or Trash. Prefers UID MOVE; falls back to COPY + \Deleted + EXPUNGE.
+    func moveUID(
+        host: String,
+        port: Int,
+        user: String,
+        credentials: MailCredentials,
+        fromFolder: String,
+        uid: String,
+        destHints: [String]
+    ) async throws {
+        let conn = try MailStream.connect(host: host, port: port, tls: .implicit)
+        defer { conn.close() }
+        _ = try conn.readLine()
+        try imapSignIn(conn, user: user, credentials: credentials)
+        let boxes = try imapList(conn)
+        let source = boxes.first(where: { $0.caseInsensitiveCompare(fromFolder) == .orderedSame }) ?? fromFolder
+        guard try imapOK(conn, "SELECT \(imapQuote(source))") else {
+            throw MailError.protocolFailure("Could not open \(source).")
+        }
+        if let dest = pickMailbox(boxes, hints: destHints) {
+            if try imapOK(conn, "UID MOVE \(uid) \(imapQuote(dest))") {
+                _ = try? conn.command("LOGOUT")
+                return
+            }
+            if try imapOK(conn, "UID COPY \(uid) \(imapQuote(dest))") {
+                _ = try conn.command("UID STORE \(uid) +FLAGS.SILENT (\\Deleted)")
+                _ = try? conn.command("UID EXPUNGE \(uid)")
+                _ = try? conn.command("EXPUNGE")
+                _ = try? conn.command("LOGOUT")
+                return
+            }
+        }
+        _ = try conn.command("UID STORE \(uid) +FLAGS.SILENT (\\Deleted)")
+        _ = try? conn.command("UID EXPUNGE \(uid)")
+        _ = try? conn.command("EXPUNGE")
+        _ = try? conn.command("LOGOUT")
+    }
+
+    func sendMail(host: String, port: Int, tls: String, user: String, credentials: MailCredentials, from: String, to: [String], raw: String) async throws {
         let mode: MailStream.TLSMode = tls == "ssl" ? .implicit : .plainThenSTARTTLS
         let conn = try MailStream.connect(host: host, port: port, tls: mode)
         defer { conn.close() }
@@ -63,12 +127,7 @@ actor MailTransport {
             try conn.startTLS()
             _ = try conn.smtp("EHLO praecipe.local")
         }
-        _ = try conn.smtp("AUTH LOGIN")
-        _ = try conn.smtp(Data(user.utf8).base64EncodedString())
-        let auth = try conn.smtp(Data(password.utf8).base64EncodedString())
-        if !auth.hasPrefix("235") {
-            throw MailError.auth("SMTP login failed. Use an app password.")
-        }
+        try smtpSignIn(conn, user: user, credentials: credentials)
         let mailFrom = try conn.smtp("MAIL FROM:<\(from)>")
         if !mailFrom.hasPrefix("250") { throw MailError.protocolFailure(mailFrom) }
         for addr in to where addr.contains("@") {
@@ -80,10 +139,33 @@ actor MailTransport {
         _ = try conn.smtp("QUIT")
     }
 
-    private func imapLogin(_ conn: MailStream, user: String, password: String) throws {
-        let r = try conn.command("LOGIN \(imapQuote(user)) \(imapQuote(password))")
-        if r.contains(" NO ") || r.contains(" BAD ") || r.hasPrefix("A") && r.contains("NO") {
-            throw MailError.auth("IMAP login failed. Use an app password, not your regular account password.")
+    private func imapSignIn(_ conn: MailStream, user: String, credentials: MailCredentials) throws {
+        switch credentials {
+        case .password(let password):
+            let r = try conn.command("LOGIN \(imapQuote(user)) \(imapQuote(password))")
+            if r.contains(" NO ") || r.contains(" BAD ") || (r.contains("NO") && r.contains("LOGIN")) {
+                throw MailError.auth("Could not sign in. Check the email and password.")
+            }
+        case .oauth(let token):
+            try conn.authenticateXOAUTH2(user: user, token: token)
+        }
+    }
+
+    private func smtpSignIn(_ conn: MailStream, user: String, credentials: MailCredentials) throws {
+        switch credentials {
+        case .password(let password):
+            _ = try conn.smtp("AUTH LOGIN")
+            _ = try conn.smtp(Data(user.utf8).base64EncodedString())
+            let auth = try conn.smtp(Data(password.utf8).base64EncodedString())
+            if !auth.hasPrefix("235") {
+                throw MailError.auth("SMTP login failed. Use an app password.")
+            }
+        case .oauth(let token):
+            let b64 = MicrosoftOAuth.xoauth2(user: user, token: token)
+            let auth = try conn.smtp("AUTH XOAUTH2 \(b64)")
+            if !auth.hasPrefix("235") {
+                throw MailError.auth("Microsoft would not send mail. Sign in again.")
+            }
         }
     }
 
@@ -122,6 +204,21 @@ actor MailTransport {
 
 private func imapQuote(_ s: String) -> String {
     "\"" + s.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"") + "\""
+}
+
+private func pickMailbox(_ boxes: [String], hints: [String]) -> String? {
+    for hint in hints {
+        if let hit = boxes.first(where: { $0.caseInsensitiveCompare(hint) == .orderedSame }) {
+            return hit
+        }
+    }
+    for hint in hints {
+        let h = hint.lowercased()
+        if let hit = boxes.first(where: { $0.lowercased().contains(h) }) {
+            return hit
+        }
+    }
+    return nil
 }
 
 private func parseListName(_ line: String) -> String? {
@@ -201,6 +298,25 @@ final class MailStream: NSObject, StreamDelegate {
             let line = try readLine()
             collected += line + "\n"
             if line.hasPrefix("\(t) ") { return collected }
+        }
+    }
+
+    func authenticateXOAUTH2(user: String, token: String) throws {
+        let t = "A\(tag)"
+        tag += 1
+        try write("\(t) \(MicrosoftOAuth.imapAuthenticateCommand(user: user, token: token))\r\n")
+        while true {
+            let line = try readLine()
+            if line.hasPrefix("+") {
+                try write("\r\n")
+                continue
+            }
+            if line.hasPrefix("\(t) ") {
+                if line.contains(" NO") || line.contains(" BAD") {
+                    throw MailError.auth("IMAP_AUTH_REJECTED")
+                }
+                return
+            }
         }
     }
 

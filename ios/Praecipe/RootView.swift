@@ -24,10 +24,11 @@ struct RootView: View {
         .safeAreaInset(edge: .top, spacing: 0) {
             if !dueReminders.isEmpty {
                 Text(dueReminders.map(\.title).joined(separator: " · "))
-                    .font(.footnote.weight(.semibold))
-                    .padding(8)
+                    .praecipeFootnote(.semibold)
+                    .foregroundStyle(PraecipeColors.textPrimary)
+                    .padding(10)
                     .frame(maxWidth: .infinity)
-                    .background(Color.orange)
+                    .background(PraecipeColors.warning.opacity(0.55))
             }
         }
         .onAppear {
@@ -46,13 +47,57 @@ struct MoreHomeView: View {
     var body: some View {
         NavigationStack {
             List {
+                Section {
+                    HStack(spacing: 16) {
+                        Image("AppLogo")
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: 56, height: 56)
+                            .accessibilityHidden(true)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Praecipe")
+                                .praecipeTitle()
+                            Text("Legal practice on iPhone")
+                                .praecipeSubheadline()
+                                .praecipeSecondaryText()
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
                 NavigationLink { TimeHomeView() } label: { Label("Time", systemImage: "clock") }
                 NavigationLink { NotesHomeView() } label: { Label("Notes", systemImage: "note.text") }
                 NavigationLink { FilesHomeView() } label: { Label("Files", systemImage: "paperclip") }
                 NavigationLink { RulesHomeView() } label: { Label("Rules", systemImage: "ruler") }
-                NavigationLink { SettingsView() } label: { Label("Settings", systemImage: "gear") }
+                NavigationLink { SettingsView() } label: { Label("Mail Accounts", systemImage: "gear") }
+                Section("About") {
+                    LabeledContent("Version", value: AppInfo.version)
+                    LabeledContent("Build", value: AppInfo.build)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Copyright © \(AppInfo.copyrightYear) Destrier")
+                            .praecipeSubheadline()
+                        Text("Made by Destrier")
+                            .praecipeCaption()
+                            .praecipeSecondaryText()
+                    }
+                    .padding(.vertical, 2)
+                }
             }
-            .navigationTitle("Praecipe")
+            .praecipeGroupedList()
+            .navigationTitle("More")
         }
+    }
+}
+
+enum AppInfo {
+    static var version: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "—"
+    }
+
+    static var build: String {
+        Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "—"
+    }
+
+    static var copyrightYear: String {
+        "2026"
     }
 }

@@ -17,17 +17,18 @@ struct CalendarHomeView: View {
                 Section(month.formatted(.dateTime.month(.wide).year())) {
                     ForEach(eventsInMonth) { e in
                         HStack {
-                            VStack(alignment: .leading) {
-                                Text(e.title).font(.headline)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(e.title).praecipeHeadline()
                                 Text(e.startAt, style: e.allDay ? .date : .date)
-                                    .font(.caption)
-                                if let m = e.matter { Text(m.label).font(.caption2).foregroundStyle(.secondary) }
+                                    .praecipeCaption()
+                                if let m = e.matter { Text(m.label).praecipeCaption2().praecipeSecondaryText() }
                             }
                             Spacer()
                             if !e.ruleCite.isEmpty {
-                                Text(e.ruleCite).font(.caption2).foregroundStyle(.orange)
+                                Text(e.ruleCite).praecipeCaption2().foregroundStyle(PraecipeColors.warning)
                             }
                         }
+                        .padding(.vertical, 2)
                     }
                 }
                 Section("Add") {
@@ -47,6 +48,7 @@ struct CalendarHomeView: View {
                     .disabled(title.isEmpty)
                 }
             }
+            .praecipeGroupedList()
             .navigationTitle("Calendar")
             .toolbar {
                 NavigationLink("Rules") { RulesHomeView() }
@@ -98,11 +100,11 @@ struct RulesHomeView: View {
             if let result {
                 LabeledContent("Due", value: result.due.formatted(date: .long, time: .omitted))
                 LabeledContent("Weekday", value: result.weekday)
-                if result.serviceExtraApplied { Text("Includes extra 5 days after service.").font(.caption) }
-                Text(result.note).font(.caption).foregroundStyle(.secondary)
+                if result.serviceExtraApplied { Text("Includes extra 5 days after service.").praecipeCaption() }
+                Text(result.note).praecipeCaption().praecipeSecondaryText()
                 Text("Practice aid, not legal advice. Confirm against the current rules, any statute, the judge’s order, and local administrative practice.")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+                    .praecipeCaption2()
+                    .praecipeSecondaryText()
                 Button("Put on calendar") {
                     let e = CalendarEvent(title: result.title, startAt: result.due, eventType: "deadline", allDay: true)
                     e.ruleCite = result.rule
@@ -113,6 +115,8 @@ struct RulesHomeView: View {
                 }
             }
         }
+        .scrollContentBackground(.hidden)
+        .background(PraecipeColors.background)
         .navigationTitle("Rules")
     }
 }
