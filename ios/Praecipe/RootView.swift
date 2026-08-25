@@ -69,6 +69,7 @@ struct MoreHomeView: View {
                 NavigationLink { FilesHomeView() } label: { Label("Files", systemImage: "paperclip") }
                 NavigationLink { RulesHomeView() } label: { Label("Rules", systemImage: "ruler") }
                 NavigationLink { SettingsView() } label: { Label("Mail Accounts", systemImage: "gear") }
+                    .accessibilityIdentifier("mailAccountsLink")
                 Section("About") {
                     LabeledContent("Version", value: AppInfo.version)
                     LabeledContent("Build", value: AppInfo.build)

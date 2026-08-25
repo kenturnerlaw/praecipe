@@ -76,6 +76,13 @@ admin = f"https://login.microsoftonline.com/{TENANT}/adminconsent?" + urllib.par
 if TENANT not in admin:
     fails.append("admin consent URL missing tenant")
 
+if CLIENT != "1f0ced9a-277d-46b6-be8b-7728315eb595":
+    fails.append("baked client id drifted")
+
+redirect = REDIRECT + "?code=abc123&session_state=ss"
+if "code=abc123" not in redirect:
+    fails.append("redirect extra query fixture broken")
+
 if fails:
     print("FAIL")
     for f in fails:

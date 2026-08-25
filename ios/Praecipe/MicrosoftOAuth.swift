@@ -51,7 +51,7 @@ enum MicrosoftOAuth {
     }
 
     static func hasRefreshSession(email: String = "") -> Bool {
-        if !email.isEmpty, !KeychainStore.load(account: "oauth-refresh:\(email)").isEmpty {
+        if !email.isEmpty, !KeychainStore.load(account: "oauth-refresh:\(email.lowercased())").isEmpty {
             return true
         }
         return !storedOAuthEmails().isEmpty && KeychainStore.load(account: consentFlagKey) == "1"
@@ -109,9 +109,10 @@ enum MicrosoftOAuth {
             throw MailError.auth("Microsoft sign-in is misconfigured.")
         }
         let hint = loginHint.trimmingCharacters(in: .whitespacesAndNewlines)
-        let hasToken = !hint.isEmpty && !KeychainStore.load(account: "oauth-refresh:\(hint)").isEmpty
-        // Known break: prompt=admin_consent first → Authenticator/MFA then no mailbox token / false failures.
-        // Known break: WKWebView → Authenticator handoff fails (use ASWebAuthenticationSession).
+        let hasToken = !hint.isEmpty && !KeychainStore.load(account: "oauth-refresh:\(hint.lowercased())").isEmpty
+        // Known break: prompt=admin_consent first → Authenticator/MFA then no mailbox token.
+        // Known break: ASWebAuthenticationSession cannot intercept HTTPS nativeclient (no Associated Domains).
+        // Sign-in is WKWebView in a full-screen cover; Authenticator returns via msauth.com.kenturnerlaw.praecipe.
         let promptValue: String?
         if let prompt, !prompt.isEmpty {
             promptValue = prompt
@@ -172,10 +173,35 @@ enum MicrosoftOAuth {
         case failure(Error)
     }
 
+    static let appBrokerScheme = "msauth.com.kenturnerlaw.praecipe"
+
+    static func isOutgoingBrokerURL(_ url: URL) -> Bool {
+        let scheme = (url.scheme ?? "").lowercased()
+        if scheme == appBrokerScheme { return false }
+        return scheme.hasPrefix("msauth")
+            || scheme == "microsoft-authenticator"
+            || scheme == "companyportal"
+    }
+
+    static func isOAuthCallback(_ url: URL) -> Bool {
+        let abs = url.absoluteString.lowercased()
+        if abs.hasPrefix(redirectURI.lowercased()) { return true }
+        return (url.scheme ?? "").lowercased() == appBrokerScheme
+    }
+
     static func outcomeFromRedirect(_ url: URL) -> RedirectOutcome? {
-        let abs = url.absoluteString
-        guard abs.lowercased().hasPrefix(redirectURI.lowercased()) else { return nil }
-        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        guard isOAuthCallback(url) else { return nil }
+        var items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        if items.isEmpty, let fragment = url.fragment, !fragment.isEmpty {
+            items = URLComponents(string: "https://x.invalid?\(fragment)")?.queryItems ?? []
+        }
+        // Authenticator may resume the app without a code yet — don't abort the web view.
+        let scheme = (url.scheme ?? "").lowercased()
+        if scheme == appBrokerScheme,
+           items.first(where: { $0.name == "code" })?.value?.isEmpty != false,
+           items.first(where: { $0.name == "error" }) == nil {
+            return nil
+        }
         if let err = items.first(where: { $0.name == "error" })?.value {
             let desc = items.first(where: { $0.name == "error_description" })?.value ?? err
             return .failure(MailError.auth(friendlyError(desc)))
@@ -194,7 +220,8 @@ enum MicrosoftOAuth {
         switch outcomeFromRedirect(url) {
         case .none: return nil
         case .code(let c): return .success(c)
-        case .adminConsentOnly: return .failure(MailError.auth("ADMIN_CONSENT_ONLY"))
+        case .adminConsentOnly:
+            return .failure(MailError.auth("Microsoft recorded admin consent but did not issue a mailbox code. Tap Sign In again."))
         case .failure(let e): return .failure(e)
         }
     }
@@ -572,6 +599,40 @@ enum MailAuthSelfCheck {
         if MicrosoftOAuth.resolvedClientID() != MicrosoftOAuth.clientID {
             out.append("resolvedClientID must return baked client ID")
         }
+        if MicrosoftOAuth.clientID != "1f0ced9a-277d-46b6-be8b-7728315eb595" {
+            out.append("baked Entra client ID drifted")
+        }
+        if let extra = URL(string: MicrosoftOAuth.redirectURI + "?code=abc123&session_state=ss&client_info=ci") {
+            if case .success(let code) = MicrosoftOAuth.codeFromRedirect(extra) {
+                if code != "abc123" { out.append("redirect with extra query failed") }
+            } else {
+                out.append("redirect with extra query not recognized")
+            }
+        }
+        if let broker = URL(string: "msauth.com.kenturnerlaw.praecipe://auth?code=broker-code") {
+            if case .success(let code) = MicrosoftOAuth.codeFromRedirect(broker) {
+                if code != "broker-code" { out.append("broker callback code parse failed") }
+            } else {
+                out.append("broker callback not recognized")
+            }
+        }
+        if MicrosoftOAuth.isOutgoingBrokerURL(URL(string: "msauth://auth")!) == false {
+            out.append("msauth must be treated as outgoing Authenticator")
+        }
+        if let baked = try? MicrosoftOAuth.startBrowser(loginHint: "lawyer@firm.com").url.absoluteString {
+            if !baked.contains("client_id=\(MicrosoftOAuth.clientID)") {
+                out.append("default startBrowser must use baked client ID")
+            }
+            if baked.contains("prompt=admin_consent") {
+                out.append("baked startBrowser must not force admin_consent")
+            }
+        } else {
+            out.append("startBrowser failed with baked client ID")
+        }
         return out
     }
+}
+
+extension Notification.Name {
+    static let praecipeMicrosoftOAuthURL = Notification.Name("praecipeMicrosoftOAuthURL")
 }

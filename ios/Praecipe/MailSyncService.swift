@@ -201,7 +201,8 @@ final class MailSyncService: ObservableObject {
         existing: [MailAccount]
     ) async throws {
         let email = email.trimmingCharacters(in: .whitespacesAndNewlines)
-        let user = imapUser.isEmpty ? email : imapUser
+        let password = password.trimmingCharacters(in: .whitespacesAndNewlines)
+        let user = imapUser.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? email : imapUser.trimmingCharacters(in: .whitespacesAndNewlines)
         lastError = nil
         status = "Signing In…"
         busy = true
@@ -311,6 +312,22 @@ final class MailSyncService: ObservableObject {
         busy = false
         status = "Signed in · Inbox verified · Fetching mail…"
         await sync(context: context)
+    }
+
+    func signOut(_ account: MailAccount, context: ModelContext) {
+        let email = account.email
+        MicrosoftOAuth.clearTokens(email: email)
+        KeychainStore.deletePassword(account: email)
+        KeychainStore.deletePassword(account: "account-meta:\(email)")
+        let all = (try? context.fetch(FetchDescriptor<MailMessage>())) ?? []
+        for msg in all where msg.accountEmail.lowercased() == email.lowercased() {
+            context.delete(msg)
+        }
+        context.delete(account)
+        try? context.save()
+        lastError = nil
+        status = "Signed out"
+        busy = false
     }
 
     func markRead(_ message: MailMessage, context: ModelContext) async {

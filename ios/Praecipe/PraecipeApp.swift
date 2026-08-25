@@ -8,12 +8,19 @@ struct PraecipeApp: App {
 
     init() {
         PraecipeTheme.configureAppearance()
+        #if DEBUG
+        let fails = MailAuthSelfCheck.failures()
+        assert(fails.isEmpty, fails.joined(separator: "\n"))
+        #endif
     }
 
     var body: some Scene {
         WindowGroup {
             RootView()
                 .praecipeThemed()
+                .onOpenURL { url in
+                    NotificationCenter.default.post(name: .praecipeMicrosoftOAuthURL, object: url)
+                }
         }
         .modelContainer(sharedModelContainer)
     }
